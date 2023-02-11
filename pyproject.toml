@@ -54,6 +54,10 @@ classifiers = [# Optional
 dependencies = [# Optional
     'torch',
     'numpy',
+    'open3d',
+    'arm-pytorch-utilities',
+    'multidim-indexing',
+    'pytorch-kinematics', # only on the transform part
 ]
 
 # List additional groups of dependencies here (e.g. development
