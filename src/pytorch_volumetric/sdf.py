@@ -185,6 +185,8 @@ class ObjectFrameSDF(abc.ABC):
 
 
 class MeshSDF(ObjectFrameSDF):
+    """SDF generated from direct ray-tracing calls to the mesh. This is relatively expensive."""
+
     def __init__(self, obj_factory: ObjectFactory, vis=None):
         self.obj_factory = obj_factory
         self.vis = vis
@@ -213,8 +215,21 @@ class MeshSDF(ObjectFrameSDF):
 
 
 class CachedSDF(ObjectFrameSDF):
-    def __init__(self, object_name, resolution, range_per_dim, gt_sdf, device="cpu", clean_cache=False,
+    """SDF via looking up precomputed voxel grids requiring a ground truth SDF to default to on uncached queries."""
+
+    def __init__(self, object_name, resolution, range_per_dim, gt_sdf: ObjectFrameSDF, device="cpu", clean_cache=False,
                  debug_check_sdf=False, cache_path="sdf_cache.pkl"):
+        """
+
+        :param object_name: str readable name of the object; combined with the resolution and range for cache
+        :param resolution: side length of each voxel cell
+        :param range_per_dim: (min, max) sequence for each dimension (e.g. 3 for 3D)
+        :param gt_sdf: ground truth SDF used to generate the cache and default to on queries outside of the cache
+        :param device: pytorch compatible device
+        :param clean_cache: whether to ignore the existing cache and force recomputation
+        :param debug_check_sdf: check that the generated SDF matches the ground truth SDF
+        :param cache_path: path where to store the SDF cache for efficient loading
+        """
         self.device = device
         # cache for signed distance field to object
         self.voxels = None
@@ -346,7 +361,7 @@ def sample_mesh_points(obj_factory: ObjectFactory = None, num_points=100, seed=0
         cache = {name: {seed: {}}}
 
     if obj_factory is None:
-        raise RuntimeError(f"Expect model points to be cached for {name} {seed} {num_points}")
+        raise RuntimeError(f"Expect model points to be cached for {name} {seed} {num_points} in {dbpath}")
 
     mesh = obj_factory._mesh
 
