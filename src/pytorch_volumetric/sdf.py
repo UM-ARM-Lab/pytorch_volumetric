@@ -1,5 +1,6 @@
 import abc
 import os
+import typing
 from typing import NamedTuple, Union
 
 import numpy as np
@@ -10,6 +11,7 @@ from arm_pytorch_utilities import tensor_utils, rand
 from multidim_indexing import torch_view
 
 from pytorch_volumetric.voxel import VoxelGrid, get_divisible_range_by_resolution, get_coordinates_and_points_in_grid
+from pytorch_kinematics import transforms as tf
 import logging
 
 logger = logging.getLogger(__name__)
@@ -23,7 +25,7 @@ class SDFQuery(NamedTuple):
 
 
 class ObjectFactory(abc.ABC):
-    def __init__(self, name, scale=2.5, vis_frame_pos=(0, 0, 0), vis_frame_rot=(0, 0, 0, 1),
+    def __init__(self, name, scale=1.0, vis_frame_pos=(0, 0, 0), vis_frame_rot=(0, 0, 0, 1),
                  plausible_suboptimality=0.001, **kwargs):
         self.name = name
         self.scale = scale
@@ -58,8 +60,10 @@ class ObjectFactory(abc.ABC):
 
     def precompute_sdf(self):
         # scale mesh the approrpiate amount
-        self._mesh = o3d.io.read_triangle_mesh(self.get_mesh_high_poly_resource_filename()).scale(self.scale,
-                                                                                                  [0, 0, 0])
+        full_path = self.get_mesh_high_poly_resource_filename()
+        if not os.path.exists(full_path):
+            raise RuntimeError(f"Expected mesh file does not exist: {full_path}")
+        self._mesh = o3d.io.read_triangle_mesh(full_path).scale(self.scale, [0, 0, 0])
         # convert from mesh object frame to simulator object frame
         x, y, z, w = self.vis_frame_rot
         self._mesh = self._mesh.rotate(o3d.geometry.get_rotation_matrix_from_quaternion((w, x, y, z)),
@@ -129,6 +133,19 @@ class ObjectFactory(abc.ABC):
         """
 
         return SDFQuery(*self._do_object_frame_closest_point(points_in_object_frame, compute_normal=compute_normal))
+
+
+class StubObjectFactory(ObjectFactory):
+    def __init__(self, mesh_name, path_prefix='', **kwargs):
+        self.path_prefix = path_prefix
+        # specify ranges=None to infer the range from the object's bounding box
+        super(StubObjectFactory, self).__init__(mesh_name, **kwargs)
+
+    def make_collision_obj(self, z, rgba=None):
+        return None, None
+
+    def get_mesh_resource_filename(self):
+        return os.path.join(self.path_prefix, self.name)
 
 
 class ObjectFrameSDF(abc.ABC):
@@ -214,6 +231,32 @@ class MeshSDF(ObjectFrameSDF):
         return res.distance, res.gradient
 
 
+class ComposedSDF(ObjectFrameSDF):
+    def __init__(self, sdfs: typing.Sequence[ObjectFrameSDF], obj_frame_to_each_frame: tf.Transform3d):
+        """
+
+        :param sdfs: N Object frame SDFs
+        :param obj_frame_to_each_frame: N x 4 x 4 transforms from the shared object frame to the frame of each SDF
+        """
+        self.sdfs = sdfs
+        self.obj_frame_to_each_frame = obj_frame_to_each_frame
+
+    def __call__(self, points_in_object_frame):
+        # pts[i] are now points in the ith SDF's frame
+        pts = self.obj_frame_to_each_frame.transform_points(points_in_object_frame)
+        sdfv = []
+        sdfg = []
+        for i, sdf in enumerate(self.sdfs):
+            v, g = sdf(pts[i])
+            sdfv.append(v)
+            sdfg.append(g)
+        sdfv = torch.cat(sdfv)
+        sdfg = torch.cat(sdfg)
+        closest = torch.argmin(sdfv, 0)
+        all = torch.arange(0, sdfv.shape[1])
+        return sdfv[closest, all], sdfg[closest, all]
+
+
 class CachedSDF(ObjectFrameSDF):
     """SDF via looking up precomputed voxel grids requiring a ground truth SDF to default to on uncached queries."""
 
@@ -284,7 +327,6 @@ class CachedSDF(ObjectFrameSDF):
         cached_underlying_sdf_grad = cached_underlying_sdf_grad.to(device=device)
         self.voxels = torch_view.TorchMultidimView(cached_underlying_sdf, range_per_dim,
                                                    invalid_value=self._fallback_sdf_value_func)
-        # TODO handle vector valued views
         self.voxels_grad = cached_underlying_sdf_grad.squeeze()
 
     def _fallback_sdf_value_func(self, *args, **kwargs):
