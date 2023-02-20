@@ -32,10 +32,10 @@ def test_urdf_to_sdf():
 
     s.set_joint_configuration(th)
 
-    y = 0
+    y = 0.02
     query_range = np.array([
         [-1, 0.5],
-        [-y, y],
+        [y, y],
         [-0.2, 0.8],
     ])
 
@@ -63,9 +63,9 @@ def test_urdf_to_sdf():
     sdf_val, sdf_grad = s(pts)
 
     norm = matplotlib.colors.Normalize(vmin=sdf_val.min().cpu() - 0.2, vmax=sdf_val.max().cpu())
-    color_map = matplotlib.cm.ScalarMappable(norm=norm)
-    rgb = color_map.to_rgba(sdf_val.reshape(-1).cpu())
-    rgb = rgb[:, :-1]
+    # color_map = matplotlib.cm.ScalarMappable(norm=norm)
+    # rgb = color_map.to_rgba(sdf_val.reshape(-1).cpu())
+    # rgb = rgb[:, :-1]
 
     surface = sdf_val.abs() < 0.005
     if vis is not None:

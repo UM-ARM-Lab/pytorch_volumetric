@@ -29,7 +29,7 @@ class RobotSDF(sdf.ObjectFrameSDF):
         self.q = None
         self.object_to_link_frames: typing.Optional[pk.Transform3d] = None
         self.joint_names = self.chain.get_joint_parameter_names()
-        self.frame_names = self.chain.get_frame_names()
+        self.frame_names = self.chain.get_frame_names(exclude_fixed=False)
         self.sdf: typing.Optional[sdf.ComposedSDF] = None
         self.sdf_to_link_name = []
 
