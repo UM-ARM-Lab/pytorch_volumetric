@@ -1,6 +1,6 @@
 [project]
 name = "pytorch_volumetric"
-version = "0.1.0"
+version = "0.2.0"
 description = "Volumetric structures such as voxels and SDFs implemented in pytorch"
 readme = "README.md" # Optional
 
@@ -57,7 +57,7 @@ dependencies = [# Optional
     'open3d',
     'arm-pytorch-utilities',
     'multidim-indexing',
-    'pytorch-kinematics', # only on the transform part
+    'pytorch-kinematics',
 ]
 
 # List additional groups of dependencies here (e.g. development
@@ -69,7 +69,7 @@ dependencies = [# Optional
 # Similar to `dependencies` above, these must be valid existing
 # projects.
 [project.optional-dependencies] # Optional
-test = ["pytest"]
+test = ["pytest", "pybullet"]
 
 # List URLs that are relevant to your project
 #

@@ -1,13 +1,14 @@
 import os
 import math
 import torch
+import time
 import matplotlib.colors
 from matplotlib import pyplot as plt
 import numpy as np
 from timeit import default_timer as timer
 
 import pytorch_kinematics as pk
-from pytorch_volumetric.model_to_sdf import RobotSDF
+from pytorch_volumetric.model_to_sdf import RobotSDF, cache_link_sdf_factory
 from pytorch_volumetric import voxel
 
 import pybullet as p
@@ -28,8 +29,12 @@ def test_urdf_to_sdf():
     search_path = pybullet_data.getDataPath()
     full_urdf = os.path.join(search_path, urdf)
     chain = pk.build_serial_chain_from_urdf(open(full_urdf).read(), "lbr_iiwa_link_7")
-    s = RobotSDF(chain, path_prefix=os.path.join(search_path, "kuka_iiwa"))
-    th = torch.tensor([0.0, -math.pi / 4.0, 0.0, math.pi / 2.0, 0.0, math.pi / 4.0, 0.0])
+    d = "cuda" if torch.cuda.is_available() else "cpu"
+
+    chain = chain.to(device=d)
+    s = RobotSDF(chain, path_prefix=os.path.join(search_path, "kuka_iiwa"),
+                 link_sdf_cls=cache_link_sdf_factory(resolution=0.02, padding=0.1, device=d))
+    th = torch.tensor([0.0, -math.pi / 4.0, 0.0, math.pi / 2.0, 0.0, math.pi / 4.0, 0.0], device=d)
 
     s.set_joint_configuration(th)
 
@@ -51,12 +56,19 @@ def test_urdf_to_sdf():
 
     vis = None
     try:
-        from base_experiments.env.env import draw_AABB
+        from base_experiments.env.env import draw_ordered_end_points, aabb_to_ordered_end_points
         from base_experiments.env.pybullet_env import DebugDrawer
         vis = DebugDrawer(1., 1.5)
         vis.toggle_3d(True)
         vis.set_camera_position([-0.1, 0, 0], yaw=-30, pitch=-20)
-        # draw_AABB(vis, query_range)
+        # draw bounding box for each link
+        tfs = s.sdf.obj_frame_to_each_frame.inverse()
+        for i in range(len(th)):
+            sdf = s.sdf.sdfs[i]
+            aabb = aabb_to_ordered_end_points(np.array(sdf.ranges))
+            aabb = tfs.transform_points(torch.tensor(aabb, device=tfs.device, dtype=tfs.dtype))[i]
+            draw_ordered_end_points(vis, aabb)
+            time.sleep(0.5)
     except:
         pass
 
@@ -64,9 +76,6 @@ def test_urdf_to_sdf():
     sdf_val, sdf_grad = s(pts)
 
     norm = matplotlib.colors.Normalize(vmin=sdf_val.min().cpu() - 0.2, vmax=sdf_val.max().cpu())
-    # color_map = matplotlib.cm.ScalarMappable(norm=norm)
-    # rgb = color_map.to_rgba(sdf_val.reshape(-1).cpu())
-    # rgb = rgb[:, :-1]
 
     surface = sdf_val.abs() < 0.005
     if vis is not None:
@@ -86,9 +95,9 @@ def test_urdf_to_sdf():
     ax = plt.gca()
     ax.set_xlabel('x')
     ax.set_ylabel('z')
-    x = coords[0]
-    z = coords[2]
-    v = sdf_val.reshape(len(x), len(z)).transpose(0, 1)
+    x = coords[0].cpu()
+    z = coords[2].cpu()
+    v = sdf_val.reshape(len(x), len(z)).transpose(0, 1).cpu()
     cset1 = ax.contourf(x, z, v, norm=norm, cmap='Greys_r')
     cset2 = ax.contour(x, z, v, colors='k', levels=[0], linestyles='dashed')
     ax.clabel(cset2, cset2.levels, inline=True, fontsize=13, fmt=fmt)
@@ -100,14 +109,14 @@ def test_batch_over_configurations():
     search_path = pybullet_data.getDataPath()
     full_urdf = os.path.join(search_path, urdf)
     chain = pk.build_serial_chain_from_urdf(open(full_urdf).read(), "lbr_iiwa_link_7")
-    # d = "cuda" if torch.cuda.is_available() else "cpu"
-    d = "cuda"
+    d = "cuda" if torch.cuda.is_available() else "cpu"
 
     chain = chain.to(device=d)
-    s = RobotSDF(chain, path_prefix=os.path.join(search_path, "kuka_iiwa"))
+    s = RobotSDF(chain, path_prefix=os.path.join(search_path, "kuka_iiwa"),
+                 link_sdf_cls=cache_link_sdf_factory(resolution=0.02, padding=1.0, device=d))
 
     th = torch.tensor([0.0, -math.pi / 4.0, 0.0, math.pi / 2.0, 0.0, math.pi / 4.0, 0.0], device=d)
-    N = 200
+    N = 20
     th_perturbation = torch.randn(N - 1, 7, device=d) * 0.1
     th = torch.cat((th.view(1, -1), th_perturbation + th))
 
@@ -137,5 +146,5 @@ def test_batch_over_configurations():
 
 
 if __name__ == "__main__":
-    # test_urdf_to_sdf()
+    test_urdf_to_sdf()
     test_batch_over_configurations()

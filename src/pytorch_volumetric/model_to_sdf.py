@@ -12,8 +12,7 @@ class RobotSDF(sdf.ObjectFrameSDF):
     The SDF is conditioned on a joint configuration which must be set."""
 
     def __init__(self, chain: pk.Chain, default_joint_config=None, path_prefix='',
-                 link_sdf_cls: typing.Callable[[sdf.ObjectFactory, ...], sdf.ObjectFrameSDF] = sdf.MeshSDF,
-                 **kwargs):
+                 link_sdf_cls: typing.Callable[[sdf.ObjectFactory], sdf.ObjectFrameSDF] = sdf.MeshSDF):
         """
 
         :param chain: Robot description; each link should be a mesh type - non-mesh geometries are ignored
@@ -44,7 +43,7 @@ class RobotSDF(sdf.ObjectFrameSDF):
                 if link_vis.geom_type == "mesh":
                     logger.info(f"{frame.link.name} offset {link_vis.offset}")
                     link_obj = sdf.StubObjectFactory(link_vis.geom_param, path_prefix=path_prefix)
-                    link_sdf = link_sdf_cls(link_obj, **kwargs)
+                    link_sdf = link_sdf_cls(link_obj)
                     self.sdf_to_link_name.append(frame.link.name)
                     sdfs.append(link_sdf)
                 else:
@@ -87,3 +86,11 @@ class RobotSDF(sdf.ObjectFrameSDF):
         number of batch dimensions.
         """
         return self.sdf(points_in_object_frame)
+
+
+def cache_link_sdf_factory(resolution=0.01, padding=0.1, **kwargs):
+    def create_sdf(obj_factory: sdf.ObjectFactory):
+        gt_sdf = sdf.MeshSDF(obj_factory)
+        return sdf.CachedSDF(obj_factory.name, resolution, obj_factory.bounding_box(padding=padding), gt_sdf, **kwargs)
+
+    return create_sdf
