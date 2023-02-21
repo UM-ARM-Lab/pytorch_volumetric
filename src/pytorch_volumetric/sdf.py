@@ -58,6 +58,19 @@ class ObjectFactory(abc.ABC):
         return dd.draw_mesh(name, self.get_mesh_resource_filename(), pose, scale=self.scale, rgba=rgba,
                             object_id=object_id, vis_frame_pos=frame_pos, vis_frame_rot=self.vis_frame_rot)
 
+    def bounding_box(self, padding=0):
+        if self._mesh is None:
+            self.precompute_sdf()
+
+        aabb = self._mesh.get_axis_aligned_bounding_box()
+        world_min = aabb.get_min_bound()
+        world_max = aabb.get_max_bound()
+        # already scaled, but we add a little padding
+        ranges = np.array(list(zip(world_min, world_max)))
+        ranges[:, 0] -= padding
+        ranges[:, 1] += padding
+        return ranges
+
     def precompute_sdf(self):
         # scale mesh the approrpiate amount
         full_path = self.get_mesh_high_poly_resource_filename()
