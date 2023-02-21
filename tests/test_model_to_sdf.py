@@ -4,6 +4,7 @@ import torch
 import matplotlib.colors
 from matplotlib import pyplot as plt
 import numpy as np
+from timeit import default_timer as timer
 
 import pytorch_kinematics as pk
 from pytorch_volumetric.model_to_sdf import RobotSDF
@@ -16,6 +17,7 @@ import logging
 
 plt.switch_backend('Qt5Agg')
 
+logger = logging.getLogger(__file__)
 logging.basicConfig(level=logging.INFO, force=True,
                     format='[%(levelname)s %(asctime)s %(pathname)s:%(lineno)d] %(message)s',
                     datefmt='%m-%d %H:%M:%S')
@@ -24,7 +26,6 @@ logging.basicConfig(level=logging.INFO, force=True,
 def test_urdf_to_sdf():
     urdf = "kuka_iiwa/model.urdf"
     search_path = pybullet_data.getDataPath()
-    # full_urdf = os.path.join(cfg.TEST_DIR, "kuka_iiwa.urdf")
     full_urdf = os.path.join(search_path, urdf)
     chain = pk.build_serial_chain_from_urdf(open(full_urdf).read(), "lbr_iiwa_link_7")
     s = RobotSDF(chain, path_prefix=os.path.join(search_path, "kuka_iiwa"))
@@ -55,7 +56,7 @@ def test_urdf_to_sdf():
         vis = DebugDrawer(1., 1.5)
         vis.toggle_3d(True)
         vis.set_camera_position([-0.1, 0, 0], yaw=-30, pitch=-20)
-        draw_AABB(vis, query_range)
+        # draw_AABB(vis, query_range)
     except:
         pass
 
@@ -94,5 +95,47 @@ def test_urdf_to_sdf():
     plt.draw()
 
 
+def test_batch_over_configurations():
+    urdf = "kuka_iiwa/model.urdf"
+    search_path = pybullet_data.getDataPath()
+    full_urdf = os.path.join(search_path, urdf)
+    chain = pk.build_serial_chain_from_urdf(open(full_urdf).read(), "lbr_iiwa_link_7")
+    # d = "cuda" if torch.cuda.is_available() else "cpu"
+    d = "cuda"
+
+    chain = chain.to(device=d)
+    s = RobotSDF(chain, path_prefix=os.path.join(search_path, "kuka_iiwa"))
+
+    th = torch.tensor([0.0, -math.pi / 4.0, 0.0, math.pi / 2.0, 0.0, math.pi / 4.0, 0.0], device=d)
+    N = 200
+    th_perturbation = torch.randn(N - 1, 7, device=d) * 0.1
+    th = torch.cat((th.view(1, -1), th_perturbation + th))
+
+    s.set_joint_configuration(th)
+
+    y = 0.02
+    query_range = np.array([
+        [-1, 0.5],
+        [y, y],
+        [-0.2, 0.8],
+    ])
+
+    coords, pts = voxel.get_coordinates_and_points_in_grid(0.01, query_range, device=s.device)
+
+    start = timer()
+    all_sdf_val, all_sdf_grad = s(pts)
+    elapsed = timer() - start
+    logger.info("configurations: %d points: %d elapsed: %fms time per config and point: %fms", N, len(pts),
+                elapsed * 1000, elapsed * 1000 / N / len(pts))
+
+    for i in range(N):
+        th_i = th[i]
+        s.set_joint_configuration(th_i)
+        sdf_val, sdf_grad = s(pts)
+        assert torch.allclose(sdf_val, all_sdf_val[i])
+        assert torch.allclose(sdf_grad, all_sdf_grad[i])
+
+
 if __name__ == "__main__":
-    test_urdf_to_sdf()
+    # test_urdf_to_sdf()
+    test_batch_over_configurations()

@@ -235,26 +235,58 @@ class ComposedSDF(ObjectFrameSDF):
     def __init__(self, sdfs: typing.Sequence[ObjectFrameSDF], obj_frame_to_each_frame: tf.Transform3d):
         """
 
-        :param sdfs: N Object frame SDFs
-        :param obj_frame_to_each_frame: N x 4 x 4 transforms from the shared object frame to the frame of each SDF
+        :param sdfs: S Object frame SDFs
+        :param obj_frame_to_each_frame: [B*]S x 4 x 4 transforms from the shared object frame to the frame of each SDF
+        These transforms are potentially arbitrarily batched B. Since Transform3D can only have one batch dimension,
+        they are flattened
         """
         self.sdfs = sdfs
-        self.obj_frame_to_each_frame = obj_frame_to_each_frame
+        self.obj_frame_to_each_frame = None
+        self.tsf_batch = None
+        self.set_transforms(obj_frame_to_each_frame)
+
+    def set_transforms(self, tsf: tf.Transform3d, batch_dim=None):
+        self.obj_frame_to_each_frame = tsf
+        self.tsf_batch = batch_dim
+        # assume a single batch dimension when not given B x N x 4 x 4
+        if tsf is not None:
+            S = len(self.sdfs)
+            S_tsf = len(self.obj_frame_to_each_frame)
+            if self.tsf_batch is None and (S_tsf != S):
+                self.tsf_batch = (S_tsf / S,)
 
     def __call__(self, points_in_object_frame):
+        pts_shape = points_in_object_frame.shape
+        S = len(self.sdfs)
         # pts[i] are now points in the ith SDF's frame
         pts = self.obj_frame_to_each_frame.transform_points(points_in_object_frame)
+        if self.tsf_batch is not None:
+            pts = pts.reshape(S, *self.tsf_batch, *pts_shape)
         sdfv = []
         sdfg = []
         for i, sdf in enumerate(self.sdfs):
             v, g = sdf(pts[i])
             sdfv.append(v)
             sdfg.append(g)
+
+        # attempt at doing things in higher dimensions
         sdfv = torch.cat(sdfv)
         sdfg = torch.cat(sdfg)
-        closest = torch.argmin(sdfv, 0)
-        all = torch.arange(0, sdfv.shape[1])
-        return sdfv[closest, all], sdfg[closest, all]
+
+        # easier solution for flattening
+        v = sdfv.reshape(S, -1)
+        g = sdfg.reshape(S, -1, 3)
+        closest = torch.argmin(v, 0)
+
+        all = torch.arange(0, v.shape[1])
+        vv = v[closest, all]
+        gg = g[closest, all]
+
+        if self.tsf_batch is not None:
+            vv = vv.reshape(*self.tsf_batch, -1)
+            gg = gg.reshape(*self.tsf_batch, -1, 3)
+
+        return vv, gg
 
 
 class CachedSDF(ObjectFrameSDF):

@@ -32,6 +32,7 @@ class RobotSDF(sdf.ObjectFrameSDF):
         self.frame_names = self.chain.get_frame_names(exclude_fixed=False)
         self.sdf: typing.Optional[sdf.ComposedSDF] = None
         self.sdf_to_link_name = []
+        self.configuration_batch = None
 
         sdfs = []
         # get the link meshes from the frames and create meshes
@@ -53,16 +54,36 @@ class RobotSDF(sdf.ObjectFrameSDF):
         self.set_joint_configuration(default_joint_config)
 
     def set_joint_configuration(self, joint_config=None):
-        """Set the joint configuration of the robot"""
+        """
+        Set the joint configuration of the robot
+        :param joint_config: [A x] M optionally arbitrarily batched joint configurations. There are M joints; A can be
+        any number of batched dimensions.
+        :return:
+        """
+        M = len(self.joint_names)
         if joint_config is None:
-            joint_config = torch.zeros(len(self.joint_names), device=self.device, dtype=self.dtype)
+            joint_config = torch.zeros(M, device=self.device, dtype=self.dtype)
+        # Transform3D only works with 1 batch dimension, so we need to manually flatten any additional ones
+        # save the batch dimensions for when retrieving points
+        if len(joint_config.shape) > 1:
+            self.configuration_batch = joint_config.shape[:-1]
+            joint_config = joint_config.reshape(-1, M)
+        else:
+            self.configuration_batch = None
         tf = self.chain.forward_kinematics(joint_config, end_only=False)
         tsfs = []
         for link_name in self.sdf_to_link_name:
             tsfs.append(tf[link_name].get_matrix())
         self.object_to_link_frames = pk.Transform3d(matrix=torch.cat(tsfs).inverse())
         if self.sdf is not None:
-            self.sdf.obj_frame_to_each_frame = self.object_to_link_frames
+            self.sdf.set_transforms(self.object_to_link_frames, batch_dim=self.configuration_batch)
 
     def __call__(self, points_in_object_frame):
+        """
+        Query for SDF value and SDF gradients for points in the robot's frame
+        :param points_in_object_frame: [B x] N x 3 optionally arbitrarily batched points in the robot frame; B can be
+        any number of batch dimensions.
+        :return: [A x] [B x] N SDF value, and [A x] [B x] N x 3 SDF gradient. A are the configurations' arbitrary
+        number of batch dimensions.
+        """
         return self.sdf(points_in_object_frame)
