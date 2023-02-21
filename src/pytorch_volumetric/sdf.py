@@ -148,11 +148,11 @@ class ObjectFactory(abc.ABC):
         return SDFQuery(*self._do_object_frame_closest_point(points_in_object_frame, compute_normal=compute_normal))
 
 
-class StubObjectFactory(ObjectFactory):
+class MeshObjectFactory(ObjectFactory):
     def __init__(self, mesh_name, path_prefix='', **kwargs):
         self.path_prefix = path_prefix
         # specify ranges=None to infer the range from the object's bounding box
-        super(StubObjectFactory, self).__init__(mesh_name, **kwargs)
+        super(MeshObjectFactory, self).__init__(mesh_name, **kwargs)
 
     def make_collision_obj(self, z, rgba=None):
         return None, None
