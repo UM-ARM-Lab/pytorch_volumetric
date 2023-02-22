@@ -118,6 +118,7 @@ s = pv.RobotSDF(chain, path_prefix=os.path.join(search_path, "kuka_iiwa"),
 
 Which when the `y=0.02` SDF slice is visualized:
 ![sdf slice](https://i.imgur.com/Putw72A.png)
+
 With surface points corresponding to:
 ![wireframe](https://i.imgur.com/L3atG9h.png)
 ![solid](https://i.imgur.com/XiAks7a.png)
