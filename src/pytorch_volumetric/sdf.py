@@ -221,10 +221,9 @@ class MeshSDF(ObjectFrameSDF):
         self.obj_factory = obj_factory
         self.vis = vis
 
+    @tensor_utils.handle_batch_input
     def __call__(self, points_in_object_frame):
-        if len(points_in_object_frame.shape) == 2:
-            points_in_object_frame = points_in_object_frame.unsqueeze(0)
-        B, N, d = points_in_object_frame.shape
+        N, d = points_in_object_frame.shape
 
         # compute SDF value for new sampled points
         res = self.obj_factory.object_frame_closest_point(points_in_object_frame)
@@ -232,15 +231,14 @@ class MeshSDF(ObjectFrameSDF):
         # points are transformed to link frame, thus it needs to compare against the object in link frame
         # objId is not in link frame and shouldn't be moved
         if self.vis is not None:
-            for b in range(B):
-                for i in range(N):
-                    self.vis.draw_point("test_point", points_in_object_frame[b, i], color=(1, 0, 0), length=0.005)
-                    self.vis.draw_2d_line(f"test_grad", points_in_object_frame[b, i],
-                                          res.gradient[b, i].detach().cpu(), color=(0, 0, 0),
-                                          size=2., scale=0.03)
-                    self.vis.draw_point("test_point_surf", res.closest[b, i].detach().cpu(), color=(0, 1, 0),
-                                        length=0.005,
-                                        label=f'{res.distance[b, i].item():.5f}')
+            for i in range(N):
+                self.vis.draw_point("test_point", points_in_object_frame[i], color=(1, 0, 0), length=0.005)
+                self.vis.draw_2d_line(f"test_grad", points_in_object_frame[i],
+                                      res.gradient[i].detach().cpu(), color=(0, 0, 0),
+                                      size=2., scale=0.03)
+                self.vis.draw_point("test_point_surf", res.closest[i].detach().cpu(), color=(0, 1, 0),
+                                    length=0.005,
+                                    label=f'{res.distance[i].item():.5f}')
         return res.distance, res.gradient
 
 
