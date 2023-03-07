@@ -183,15 +183,17 @@ class ObjectFrameSDF(abc.ABC):
         outside = sdf_values > surface_level
         return outside
 
-    def get_voxel_view(self, voxels: VoxelGrid = None) -> torch_view.TorchMultidimView:
+    def get_voxel_view(self, voxels: VoxelGrid = None, dtype=torch.float, device='cpu') -> torch_view.TorchMultidimView:
         """
         Get a voxel view of a part of the SDF
         :param voxels: the voxel over which to evaluate the SDF; if left as none, take the default range which is
         implementation dependent
+        :param dtype: torch type of the default voxel grid (can be safely omitted if voxels is supplied)
+        :param device: torch device of the default voxel grid (can be safely omitted if voxels is supplied)
         :return:
         """
         if voxels is None:
-            voxels = VoxelGrid(0.01, [[-1, 1], [-1, 1], [-0.6, 1]])
+            voxels = VoxelGrid(0.01, [[-1, 1], [-1, 1], [-0.6, 1]], dtype=dtype, device=device)
 
         pts = voxels.get_voxel_center_points()
         sdf_val, sdf_grad = self.__call__(pts.unsqueeze(0))
@@ -199,15 +201,19 @@ class ObjectFrameSDF(abc.ABC):
 
         return torch_view.TorchMultidimView(cached_underlying_sdf, voxels.range_per_dim, invalid_value=self.__call__)
 
-    def get_filtered_points(self, unary_filter, voxels: VoxelGrid = None) -> torch.tensor:
+    def get_filtered_points(self, unary_filter, voxels: VoxelGrid = None, dtype=torch.float,
+                            device='cpu') -> torch.tensor:
         """
         Get a N x d sequence of points extracted from a voxel grid such that their SDF values satisfy a given
         unary filter (on their SDF value)
-        :param unary_filter: filter on the SDF value of each point, evaluting to true results in accepting that point
-        :param voxels:
+        :param unary_filter: filter on the SDF value of each point, evaluating to true results in accepting that point
+        :param voxels: voxel grid over which to evaluate each point (there can be infinitely many points satisfying
+        the unary filter and we need to restrict our search over a grid of points [center of the voxels])
+        :param dtype: torch type of the default voxel grid (can be safely omitted if voxels is supplied)
+        :param device: torch device of the default voxel grid (can be safely omitted if voxels is supplied)
         :return:
         """
-        model_voxels = self.get_voxel_view(voxels)
+        model_voxels = self.get_voxel_view(voxels, dtype=dtype, device=device)
         interior = unary_filter(model_voxels.raw_data)
         indices = interior.nonzero()
         # these points are in object frame
