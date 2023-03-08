@@ -82,6 +82,9 @@ def test_urdf_to_sdf():
     if vis is not None:
         vis.draw_points("surface", pts[surface])
 
+    p.disconnect()
+
+
 
 def test_batch_over_configurations():
     urdf = "kuka_iiwa/model.urdf"
@@ -170,9 +173,10 @@ def test_bounding_box():
         print(e)
 
     time.sleep(2)
+    p.disconnect()
 
 
 if __name__ == "__main__":
-    # test_urdf_to_sdf()
-    # test_batch_over_configurations()
+    test_urdf_to_sdf()
+    test_batch_over_configurations()
     test_bounding_box()

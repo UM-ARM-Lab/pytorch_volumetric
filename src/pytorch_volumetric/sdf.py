@@ -201,7 +201,7 @@ class ObjectFrameSDF(abc.ABC):
         :return:
         """
         if voxels is None:
-            voxels = VoxelGrid(0.01, [[-1, 1], [-1, 1], [-0.6, 1]], dtype=dtype, device=device)
+            voxels = VoxelGrid(0.01, self.surface_bounding_box(padding=0.1).cpu().numpy(), dtype=dtype, device=device)
 
         pts = voxels.get_voxel_center_points()
         sdf_val, sdf_grad = self.__call__(pts.unsqueeze(0))
