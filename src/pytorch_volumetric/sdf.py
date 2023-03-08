@@ -58,7 +58,7 @@ class ObjectFactory(abc.ABC):
         return dd.draw_mesh(name, self.get_mesh_resource_filename(), pose, scale=self.scale, rgba=rgba,
                             object_id=object_id, vis_frame_pos=frame_pos, vis_frame_rot=self.vis_frame_rot)
 
-    def bounding_box(self, padding=0):
+    def bounding_box(self, padding=0.):
         if self._mesh is None:
             self.precompute_sdf()
 
@@ -171,6 +171,14 @@ class ObjectFrameSDF(abc.ABC):
             towards higher SDF values (away from surface when outside the object and towards the surface when inside)
         """
 
+    @abc.abstractmethod
+    def surface_bounding_box(self, padding=0.):
+        """
+        Get the bounding box for the 0-level set in the form of a sequence of (min,max) coordinates
+        :param padding: amount to inflate the min and max from the actual bounding box
+        :return: (min,max) for each dimension
+        """
+
     def outside_surface(self, points_in_object_frame, surface_level=0):
         """
         Check if query points are outside the surface level set; separate from querying the values since some
@@ -227,6 +235,9 @@ class MeshSDF(ObjectFrameSDF):
         self.obj_factory = obj_factory
         self.vis = vis
 
+    def surface_bounding_box(self, padding=0.):
+        return torch.tensor(self.obj_factory.bounding_box(padding))
+
     @tensor_utils.handle_batch_input
     def __call__(self, points_in_object_frame):
         N, d = points_in_object_frame.shape
@@ -258,9 +269,22 @@ class ComposedSDF(ObjectFrameSDF):
         they are flattened
         """
         self.sdfs = sdfs
-        self.obj_frame_to_each_frame = None
+        self.obj_frame_to_each_frame: typing.Optional[tf.Transform3d] = None
         self.tsf_batch = None
         self.set_transforms(obj_frame_to_each_frame)
+
+    def surface_bounding_box(self, padding=0.):
+        bounds = []
+        tsf = self.obj_frame_to_each_frame.inverse()
+        for i, sdf in enumerate(self.sdfs):
+            pts = sdf.surface_bounding_box(padding=padding)
+            pts = tsf.transform_points(pts.to(dtype=tsf.dtype, device=tsf.device).transpose(0, 1))
+            bounds.append(pts[i])
+        bounds = torch.stack(bounds)
+
+        mins = bounds.amin(dim=(0, 1))
+        maxs = bounds.amax(dim=(0, 1))
+        return torch.stack((mins, maxs)).transpose(0, 1)
 
     def set_transforms(self, tsf: tf.Transform3d, batch_dim=None):
         self.obj_frame_to_each_frame = tsf
@@ -377,6 +401,9 @@ class CachedSDF(ObjectFrameSDF):
         self.voxels = torch_view.TorchMultidimView(cached_underlying_sdf, range_per_dim,
                                                    invalid_value=self._fallback_sdf_value_func)
         self.voxels_grad = cached_underlying_sdf_grad.squeeze()
+
+    def surface_bounding_box(self, padding=0.):
+        return self.gt_sdf.surface_bounding_box(padding)
 
     def _fallback_sdf_value_func(self, *args, **kwargs):
         sdf_val, _ = self.gt_sdf(*args, **kwargs)
