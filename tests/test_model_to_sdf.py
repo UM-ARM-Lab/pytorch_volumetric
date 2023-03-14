@@ -5,7 +5,7 @@ import time
 from matplotlib import pyplot as plt
 import numpy as np
 from timeit import default_timer as timer
-
+import open3d as o3d
 import pytorch_kinematics as pk
 import pytorch_volumetric as pv
 
@@ -23,6 +23,7 @@ logging.basicConfig(level=logging.INFO, force=True,
 
 
 def test_urdf_to_sdf():
+    visualization = "open3d"
     urdf = "kuka_iiwa/model.urdf"
     search_path = pybullet_data.getDataPath()
     full_urdf = os.path.join(search_path, urdf)
@@ -44,33 +45,6 @@ def test_urdf_to_sdf():
         [-0.2, 0.8],
     ])
 
-    # toggles - g:GUI w:wireframe j:joint axis a:AABB i:interrupt
-    p.connect(p.GUI)
-    p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0)
-    p.setAdditionalSearchPath(search_path)
-    armId = p.loadURDF(urdf, [0, 0, 0], useFixedBase=True)
-    # p.resetBasePositionAndOrientation(armId, [0, 0, 0], [0, 0, 0, 1])
-    for i, q in enumerate(th):
-        p.resetJointState(armId, i, q.item())
-
-    vis = None
-    try:
-        from base_experiments.env.env import draw_ordered_end_points
-        from base_experiments.env.pybullet_env import DebugDrawer
-        vis = DebugDrawer(1., 1.5)
-        vis.toggle_3d(True)
-        vis.set_camera_position([-0.1, 0, 0], yaw=-30, pitch=-20)
-        # draw bounding box for each link (set breakpoints here to better see the link frame bounding box)
-        tfs = s.sdf.obj_frame_to_link_frame.inverse()
-        for i in range(len(th)):
-            sdf = s.sdf.sdfs[i]
-            aabb = pv.aabb_to_ordered_end_points(np.array(sdf.ranges))
-            aabb = tfs.transform_points(torch.tensor(aabb, device=tfs.device, dtype=tfs.dtype))[i]
-            draw_ordered_end_points(vis, aabb)
-            time.sleep(0.2)
-    except:
-        pass
-
     plt.ion()
     plt.show()
 
@@ -79,10 +53,41 @@ def test_urdf_to_sdf():
     pts = ret[2]
 
     surface = sdf_val.abs() < 0.005
-    if vis is not None:
-        vis.draw_points("surface", pts[surface])
 
-    p.disconnect()
+    if visualization == "pybullet":
+        # toggles - g:GUI w:wireframe j:joint axis a:AABB i:interrupt
+        p.connect(p.GUI)
+        p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0)
+        p.setAdditionalSearchPath(search_path)
+        armId = p.loadURDF(urdf, [0, 0, 0], useFixedBase=True)
+        # p.resetBasePositionAndOrientation(armId, [0, 0, 0], [0, 0, 0, 1])
+        for i, q in enumerate(th):
+            p.resetJointState(armId, i, q.item())
+
+        try:
+            from base_experiments.env.env import draw_ordered_end_points
+            from base_experiments.env.pybullet_env import DebugDrawer
+            vis = DebugDrawer(1., 1.5)
+            vis.toggle_3d(True)
+            vis.set_camera_position([-0.1, 0, 0], yaw=-30, pitch=-20)
+            # draw bounding box for each link (set breakpoints here to better see the link frame bounding box)
+            tfs = s.sdf.obj_frame_to_link_frame.inverse()
+            for i in range(len(th)):
+                sdf = s.sdf.sdfs[i]
+                aabb = pv.aabb_to_ordered_end_points(np.array(sdf.ranges))
+                aabb = tfs.transform_points(torch.tensor(aabb, device=tfs.device, dtype=tfs.dtype))[i]
+                draw_ordered_end_points(vis, aabb)
+                time.sleep(0.2)
+
+            vis.draw_points("surface", pts[surface])
+        except:
+            pass
+        finally:
+            p.disconnect()
+    elif visualization == "open3d":
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(pts[surface].cpu().numpy())
+        o3d.visualization.draw_geometries(pv.get_transformed_meshes(s) + [pcd])
 
 
 def test_batch_over_configurations():
