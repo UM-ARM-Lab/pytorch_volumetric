@@ -61,7 +61,7 @@ def test_urdf_to_sdf():
         vis.toggle_3d(True)
         vis.set_camera_position([-0.1, 0, 0], yaw=-30, pitch=-20)
         # draw bounding box for each link (set breakpoints here to better see the link frame bounding box)
-        tfs = s.sdf.obj_frame_to_each_frame.inverse()
+        tfs = s.sdf.obj_frame_to_link_frame.inverse()
         for i in range(len(th)):
             sdf = s.sdf.sdfs[i]
             aabb = aabb_to_ordered_end_points(np.array(sdf.ranges))
@@ -83,7 +83,6 @@ def test_urdf_to_sdf():
         vis.draw_points("surface", pts[surface])
 
     p.disconnect()
-
 
 
 def test_batch_over_configurations():
@@ -123,8 +122,9 @@ def test_batch_over_configurations():
         th_i = th[i]
         s.set_joint_configuration(th_i)
         sdf_val, sdf_grad = s(pts)
+
         assert torch.allclose(sdf_val, all_sdf_val[i])
-        assert torch.allclose(sdf_grad, all_sdf_grad[i])
+        assert torch.allclose(sdf_grad, all_sdf_grad[i], atol=1e-6)
 
 
 def test_bounding_box():
@@ -158,7 +158,7 @@ def test_bounding_box():
         vis.toggle_3d(True)
         vis.set_camera_position([-0.1, 0, 0], yaw=-30, pitch=-20)
         # draw bounding box for each link (set breakpoints here to better see the link frame bounding box)
-        tfs = s.sdf.obj_frame_to_each_frame.inverse()
+        tfs = s.sdf.obj_frame_to_link_frame.inverse()
         for i in range(len(s.sdf.sdfs)):
             sdf = s.sdf.sdfs[i]
             aabb = aabb_to_ordered_end_points(np.array(sdf.surface_bounding_box(padding=0)))

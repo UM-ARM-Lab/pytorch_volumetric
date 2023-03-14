@@ -34,6 +34,7 @@ class RobotSDF(sdf.ObjectFrameSDF):
         self.configuration_batch = None
 
         sdfs = []
+        offsets = []
         # get the link meshes from the frames and create meshes
         for frame_name in self.frame_names:
             frame = self.chain.find_frame(frame_name)
@@ -46,9 +47,11 @@ class RobotSDF(sdf.ObjectFrameSDF):
                     link_sdf = link_sdf_cls(link_obj)
                     self.sdf_to_link_name.append(frame.link.name)
                     sdfs.append(link_sdf)
+                    offsets.append(link_vis.offset)
                 else:
                     logger.warning(f"Cannot handle non-mesh link visual type {link_vis}")
 
+        self.offset_transforms = offsets[0].stack(*offsets[1:]).to(device=self.device, dtype=self.dtype)
         self.sdf = sdf.ComposedSDF(sdfs, self.object_to_link_frames)
         self.set_joint_configuration(default_joint_config)
 
@@ -76,7 +79,11 @@ class RobotSDF(sdf.ObjectFrameSDF):
         tsfs = []
         for link_name in self.sdf_to_link_name:
             tsfs.append(tf[link_name].get_matrix())
-        self.object_to_link_frames = pk.Transform3d(matrix=torch.cat(tsfs).inverse())
+        # make offset transforms have compatible batch dimensions
+        offset_tsf = self.offset_transforms
+        if self.configuration_batch is not None:
+            offset_tsf = pk.Transform3d(matrix=offset_tsf.get_matrix().repeat(*self.configuration_batch, 1, 1))
+        self.object_to_link_frames = pk.Transform3d(matrix=torch.cat(tsfs).inverse()).compose(offset_tsf)
         if self.sdf is not None:
             self.sdf.set_transforms(self.object_to_link_frames, batch_dim=self.configuration_batch)
 

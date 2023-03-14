@@ -1,4 +1,5 @@
 import abc
+import math
 import os
 import typing
 from typing import NamedTuple, Union
@@ -11,7 +12,7 @@ from arm_pytorch_utilities import tensor_utils, rand
 from multidim_indexing import torch_view
 
 from pytorch_volumetric.voxel import VoxelGrid, get_divisible_range_by_resolution, get_coordinates_and_points_in_grid
-from pytorch_kinematics import transforms as tf
+import pytorch_kinematics as pk
 import logging
 
 logger = logging.getLogger(__name__)
@@ -151,6 +152,9 @@ class ObjectFactory(abc.ABC):
 class MeshObjectFactory(ObjectFactory):
     def __init__(self, mesh_name, path_prefix='', **kwargs):
         self.path_prefix = path_prefix
+        # whether to strip the package:// prefix from the mesh name, for example if we are loading a mesh manually
+        # with a path prefix
+        self.strip_package_prefix = path_prefix != ''
         # specify ranges=None to infer the range from the object's bounding box
         super(MeshObjectFactory, self).__init__(mesh_name, **kwargs)
 
@@ -158,7 +162,10 @@ class MeshObjectFactory(ObjectFactory):
         return None, None
 
     def get_mesh_resource_filename(self):
-        return os.path.join(self.path_prefix, self.name)
+        mesh_path = self.name
+        if self.strip_package_prefix:
+            mesh_path = mesh_path.replace("package://", "")
+        return os.path.join(self.path_prefix, mesh_path)
 
 
 class ObjectFrameSDF(abc.ABC):
@@ -238,9 +245,8 @@ class MeshSDF(ObjectFrameSDF):
     def surface_bounding_box(self, padding=0.):
         return torch.tensor(self.obj_factory.bounding_box(padding))
 
-    @tensor_utils.handle_batch_input
     def __call__(self, points_in_object_frame):
-        N, d = points_in_object_frame.shape
+        N, d = points_in_object_frame.shape[-2:]
 
         # compute SDF value for new sampled points
         res = self.obj_factory.object_frame_closest_point(points_in_object_frame)
@@ -249,18 +255,18 @@ class MeshSDF(ObjectFrameSDF):
         # objId is not in link frame and shouldn't be moved
         if self.vis is not None:
             for i in range(N):
-                self.vis.draw_point("test_point", points_in_object_frame[i], color=(1, 0, 0), length=0.005)
-                self.vis.draw_2d_line(f"test_grad", points_in_object_frame[i],
-                                      res.gradient[i].detach().cpu(), color=(0, 0, 0),
+                self.vis.draw_point("test_point", points_in_object_frame[..., i, :], color=(1, 0, 0), length=0.005)
+                self.vis.draw_2d_line(f"test_grad", points_in_object_frame[..., i, :],
+                                      res.gradient[..., i, :].detach().cpu(), color=(0, 0, 0),
                                       size=2., scale=0.03)
-                self.vis.draw_point("test_point_surf", res.closest[i].detach().cpu(), color=(0, 1, 0),
+                self.vis.draw_point("test_point_surf", res.closest[..., i, :].detach().cpu(), color=(0, 1, 0),
                                     length=0.005,
-                                    label=f'{res.distance[i].item():.5f}')
+                                    label=f'{res.distance[..., i].item():.5f}')
         return res.distance, res.gradient
 
 
 class ComposedSDF(ObjectFrameSDF):
-    def __init__(self, sdfs: typing.Sequence[ObjectFrameSDF], obj_frame_to_each_frame: tf.Transform3d):
+    def __init__(self, sdfs: typing.Sequence[ObjectFrameSDF], obj_frame_to_each_frame: pk.Transform3d):
         """
 
         :param sdfs: S Object frame SDFs
@@ -269,13 +275,14 @@ class ComposedSDF(ObjectFrameSDF):
         they are flattened
         """
         self.sdfs = sdfs
-        self.obj_frame_to_each_frame: typing.Optional[tf.Transform3d] = None
+        self.obj_frame_to_link_frame: typing.Optional[pk.Transform3d] = None
+        self.link_frame_to_obj_frame: typing.Optional[typing.Sequence[pk.Transform3d]] = None
         self.tsf_batch = None
         self.set_transforms(obj_frame_to_each_frame)
 
     def surface_bounding_box(self, padding=0.):
         bounds = []
-        tsf = self.obj_frame_to_each_frame.inverse()
+        tsf = self.obj_frame_to_link_frame.inverse()
         for i, sdf in enumerate(self.sdfs):
             pts = sdf.surface_bounding_box(padding=padding)
             pts = tsf.transform_points(pts.to(dtype=tsf.dtype, device=tsf.device).transpose(0, 1))
@@ -286,27 +293,37 @@ class ComposedSDF(ObjectFrameSDF):
         maxs = bounds.amax(dim=(0, 1))
         return torch.stack((mins, maxs)).transpose(0, 1)
 
-    def set_transforms(self, tsf: tf.Transform3d, batch_dim=None):
-        self.obj_frame_to_each_frame = tsf
+    def set_transforms(self, tsf: pk.Transform3d, batch_dim=None):
+        self.obj_frame_to_link_frame = tsf
+        self.link_frame_to_obj_frame = []
         self.tsf_batch = batch_dim
         # assume a single batch dimension when not given B x N x 4 x 4
         if tsf is not None:
             S = len(self.sdfs)
-            S_tsf = len(self.obj_frame_to_each_frame)
+            S_tsf = len(self.obj_frame_to_link_frame)
+            total_to_slice = 1
             if self.tsf_batch is None and (S_tsf != S):
                 self.tsf_batch = (S_tsf / S,)
+            if self.tsf_batch is not None:
+                total_to_slice = math.prod(list(self.tsf_batch))
+            m = tsf.get_matrix().inverse()
+            for i in range(S):
+                self.link_frame_to_obj_frame.append(
+                    pk.Transform3d(matrix=m[i * total_to_slice:(i + 1) * total_to_slice]))
 
     def __call__(self, points_in_object_frame):
         pts_shape = points_in_object_frame.shape
         S = len(self.sdfs)
         # pts[i] are now points in the ith SDF's frame
-        pts = self.obj_frame_to_each_frame.transform_points(points_in_object_frame)
+        pts = self.obj_frame_to_link_frame.transform_points(points_in_object_frame)
         if self.tsf_batch is not None:
             pts = pts.reshape(S, *self.tsf_batch, *pts_shape)
         sdfv = []
         sdfg = []
         for i, sdf in enumerate(self.sdfs):
             v, g = sdf(pts[i])
+            # need to transform the gradient back to the object frame
+            g = self.link_frame_to_obj_frame[i].transform_normals(g)
             sdfv.append(v)
             sdfg.append(g)
 
@@ -446,7 +463,7 @@ class CachedSDF(ObjectFrameSDF):
         outside[inbound_keys] = self.voxels.raw_data[keys_ravelled[inbound_keys]] > surface_level
         return outside
 
-    def get_voxel_view(self, voxels: VoxelGrid = None) -> torch_view.TorchMultidimView:
+    def get_voxel_view(self, voxels: VoxelGrid = None, dtype=torch.float, device='cpu') -> torch_view.TorchMultidimView:
         if voxels is None:
             return self.voxels
 
