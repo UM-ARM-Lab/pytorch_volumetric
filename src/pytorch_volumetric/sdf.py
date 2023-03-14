@@ -123,13 +123,20 @@ class ObjectFactory(abc.ABC):
         # fix gradient direction to point away from surface outside
         gradient[~is_inside] *= -1
 
-        pts, distances, gradient = tensor_utils.ensure_tensor(device, dtype, pts, distance, gradient)
+        # for any points very close to the surface, it is better to use the surface normal as the gradient
+        # this is because the closest point on the surface may be noisy when close by
+        # e.g. if you are actually on the surface, the closest surface point is itself so you get no gradient info
+        on_surface = np.abs(distance) < 1e-3
+        surface_normals = self._face_normals[face_ids.numpy()[on_surface]]
+        gradient[on_surface] = surface_normals
+
+        pts, distance, gradient = tensor_utils.ensure_tensor(device, dtype, pts, distance, gradient)
 
         normals = None
         if compute_normal:
             normals = self._face_normals[face_ids.numpy()]
             normals = torch.tensor(normals, device=device, dtype=dtype)
-        return pts, distances, gradient, normals
+        return pts, distance, gradient, normals
 
     def object_frame_closest_point(self, points_in_object_frame, compute_normal=False) -> SDFQuery:
         """
@@ -497,6 +504,9 @@ def sample_mesh_points(obj_factory: ObjectFactory = None, num_points=100, seed=0
 
     if obj_factory is None:
         raise RuntimeError(f"Expect model points to be cached for {name} {seed} {num_points} in {dbpath}")
+
+    if obj_factory._mesh is None:
+        obj_factory.precompute_sdf()
 
     mesh = obj_factory._mesh
 
