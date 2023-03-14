@@ -1,5 +1,8 @@
+import copy
+
 from pytorch_volumetric import voxel
 from pytorch_volumetric import sdf
+from pytorch_volumetric import model_to_sdf
 from matplotlib import pyplot as plt
 import matplotlib.colors
 
@@ -57,3 +60,29 @@ def draw_sdf_slice(s: sdf.ObjectFrameSDF, query_range, resolution=0.01, interior
     plt.draw()
     plt.pause(0.005)
     return sdf_val, sdf_grad, pts, ax, cset1, cset2
+
+
+def get_transformed_meshes(robot_sdf: model_to_sdf.RobotSDF, obj_to_world_tsf=None):
+    """Get the meshes of each link of the robot, transformed to the world frame.
+    Each link is assumed to be a MeshSDF.
+    You can use this like:
+
+    import open3d as o3d
+    meshes = get_transformed_meshes(robot_sdf)
+    o3d.visualization.draw_geometries(meshes)
+    """
+
+    meshes = []
+    # link to obj in the form of (object) H (link)
+    tsfs = robot_sdf.sdf.obj_frame_to_link_frame.inverse()
+    # given a transform in the form of (world) H (object)
+    if obj_to_world_tsf is not None:
+        # compose the transform to get (world) H (link)
+        tsfs = obj_to_world_tsf.compose(tsfs)
+    tsfs = tsfs.get_matrix()
+    for i in range(len(robot_sdf.sdf_to_link_name)):
+        # assuming they are individually MeshSDFs
+        mesh = copy.deepcopy(robot_sdf.sdf.sdfs[i].obj_factory._mesh)
+        mesh = mesh.transform(tsfs[i].cpu().numpy())
+        meshes.append(mesh)
+    return meshes
