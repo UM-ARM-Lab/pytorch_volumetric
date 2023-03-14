@@ -1,4 +1,6 @@
 import typing
+
+import numpy as np
 import torch
 import pytorch_kinematics as pk
 from pytorch_volumetric import sdf
@@ -58,6 +60,23 @@ class RobotSDF(sdf.ObjectFrameSDF):
     def surface_bounding_box(self, padding=0.):
         return self.sdf.surface_bounding_box(padding=padding)
 
+    def link_bounding_boxes(self):
+        """
+        Get the bounding box of each link in the robot's frame under the current configuration.
+        Note that the bounding box is not necessarily axis-aligned, so the returned bounding box is not just
+        the min and max of the points.
+        :return: [A x] [B x] 8 x 3 points of the bounding box for each link in the robot's frame
+        """
+        tfs = self.sdf.obj_frame_to_link_frame.inverse()
+        bbs = []
+        for i in range(len(self.sdf.sdfs)):
+            sdf = self.sdf.sdfs[i]
+            bb = aabb_to_ordered_end_points(sdf.surface_bounding_box(padding=0))
+            bb = tfs.transform_points(torch.tensor(bb, device=tfs.device, dtype=tfs.dtype))[
+                self.sdf.ith_transform_slice(i)]
+            bbs.append(bb)
+        return torch.stack(bbs).squeeze()
+
     def set_joint_configuration(self, joint_config=None):
         """
         Set the joint configuration of the robot
@@ -104,3 +123,21 @@ def cache_link_sdf_factory(resolution=0.01, padding=0.1, **kwargs):
         return sdf.CachedSDF(obj_factory.name, resolution, obj_factory.bounding_box(padding=padding), gt_sdf, **kwargs)
 
     return create_sdf
+
+
+def aabb_to_ordered_end_points(aabb):
+    aabbMin = aabb[:, 0]
+    aabbMax = aabb[:, 1]
+    arr = [
+        [aabbMin[0], aabbMin[1], aabbMin[2]],
+        [aabbMax[0], aabbMin[1], aabbMin[2]],
+        [aabbMin[0], aabbMax[1], aabbMin[2]],
+        [aabbMin[0], aabbMin[1], aabbMax[2]],
+        [aabbMin[0], aabbMax[1], aabbMax[2]],
+        [aabbMax[0], aabbMin[1], aabbMax[2]],
+        [aabbMax[0], aabbMax[1], aabbMin[2]],
+        [aabbMax[0], aabbMax[1], aabbMax[2]]
+    ]
+    if torch.is_tensor(aabb):
+        return torch.tensor(arr, device=aabb.device, dtype=aabb.dtype)
+    return np.array(arr)

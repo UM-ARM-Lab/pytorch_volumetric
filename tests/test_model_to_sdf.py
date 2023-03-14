@@ -55,7 +55,7 @@ def test_urdf_to_sdf():
 
     vis = None
     try:
-        from base_experiments.env.env import draw_ordered_end_points, aabb_to_ordered_end_points
+        from base_experiments.env.env import draw_ordered_end_points
         from base_experiments.env.pybullet_env import DebugDrawer
         vis = DebugDrawer(1., 1.5)
         vis.toggle_3d(True)
@@ -64,7 +64,7 @@ def test_urdf_to_sdf():
         tfs = s.sdf.obj_frame_to_link_frame.inverse()
         for i in range(len(th)):
             sdf = s.sdf.sdfs[i]
-            aabb = aabb_to_ordered_end_points(np.array(sdf.ranges))
+            aabb = pv.aabb_to_ordered_end_points(np.array(sdf.ranges))
             aabb = tfs.transform_points(torch.tensor(aabb, device=tfs.device, dtype=tfs.dtype))[i]
             draw_ordered_end_points(vis, aabb)
             time.sleep(0.2)
@@ -151,19 +151,17 @@ def test_bounding_box():
         p.resetJointState(armId, i, q.item())
 
     try:
-        from base_experiments.env.env import draw_ordered_end_points, aabb_to_ordered_end_points, draw_AABB
+        from base_experiments.env.env import draw_ordered_end_points, draw_AABB
         from base_experiments.env.pybullet_env import DebugDrawer
         delay = 0.2
         vis = DebugDrawer(1., 1.5)
         vis.toggle_3d(True)
         vis.set_camera_position([-0.1, 0, 0], yaw=-30, pitch=-20)
         # draw bounding box for each link (set breakpoints here to better see the link frame bounding box)
-        tfs = s.sdf.obj_frame_to_link_frame.inverse()
+        bbs = s.link_bounding_boxes()
         for i in range(len(s.sdf.sdfs)):
-            sdf = s.sdf.sdfs[i]
-            aabb = aabb_to_ordered_end_points(np.array(sdf.surface_bounding_box(padding=0)))
-            aabb = tfs.transform_points(torch.tensor(aabb, device=tfs.device, dtype=tfs.dtype))[i]
-            draw_ordered_end_points(vis, aabb)
+            bb = bbs[i]
+            draw_ordered_end_points(vis, bb)
             time.sleep(delay)
         # total aabb
         aabb = s.surface_bounding_box(padding=0)

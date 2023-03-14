@@ -316,7 +316,14 @@ class ComposedSDF(ObjectFrameSDF):
             m = tsf.get_matrix().inverse()
             for i in range(S):
                 self.link_frame_to_obj_frame.append(
-                    pk.Transform3d(matrix=m[i * total_to_slice:(i + 1) * total_to_slice]))
+                    pk.Transform3d(matrix=m[self.ith_transform_slice(i)]))
+
+    def ith_transform_slice(self, i):
+        if self.tsf_batch is None:
+            return slice(i, i + 1)
+        else:
+            total_to_slice = math.prod(list(self.tsf_batch))
+            return slice(i * total_to_slice, (i + 1) * total_to_slice)
 
     def __call__(self, points_in_object_frame):
         pts_shape = points_in_object_frame.shape
