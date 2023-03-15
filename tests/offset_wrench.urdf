@@ -1,0 +1,71 @@
+<robot name="wrench">
+  <material name="trans_grey">
+    <color rgba="0.2 0.2 0.2 0.5"/>
+  </material>
+  <link name="link_x_trans"/>
+  <link name="link_y_trans"/>
+  <link name="link_z_trans"/>
+  <link name="link_x_rot"/>
+  <link name="link_y_rot"/>
+  <link name="link_z_rot"/>
+  <link name="offset_wrench">
+    <inertial>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <mass value="0.00987"/>
+      <inertia ixx="0.0001" ixy="0" ixz="0" iyy="0.0001" iyz="0" izz="0.0001"/>
+    </inertial>
+    <visual>
+      <geometry>
+        <mesh filename="offset_wrench_nogrip.obj"/>
+      </geometry>
+      <material name="trans_grey"/>
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="offset_wrench_nogrip.obj"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="x_trans" type="prismatic">
+    <origin rpy="0 0 0" xyz="0 0 0"/>
+    <parent link="link_x_trans"/>
+    <child link="link_y_trans"/>
+    <axis xyz="1 0 0"/>
+    <limit effort="100" lower="-10" upper="10" velocity="100"/>
+  </joint>
+  <joint name="y_trans" type="prismatic">
+    <origin rpy="0 0 0" xyz="0 0 0"/>
+    <parent link="link_y_trans"/>
+    <child link="link_z_trans"/>
+    <axis xyz="0 1 0"/>
+    <limit effort="100" lower="-10" upper="10" velocity="100"/>
+  </joint>
+  <joint name="z_trans" type="prismatic">
+    <origin rpy="0 0 0" xyz="0 0 0"/>
+    <parent link="link_z_trans"/>
+    <child link="link_x_rot"/>
+    <axis xyz="0 0 1"/>
+    <limit effort="100" lower="-10" upper="10" velocity="100"/>
+  </joint>
+  <joint name="x_rot" type="revolute">
+    <origin rpy="0 0 0" xyz="0 0 0"/>
+    <parent link="link_x_rot"/>
+    <child link="link_y_rot"/>
+    <axis xyz="1 0 0"/>
+    <limit effort="100" lower="-10" upper="10" velocity="100"/>
+  </joint>
+  <joint name="y_rot" type="revolute">
+    <origin rpy="0 0 0" xyz="0 0 0"/>
+    <parent link="link_y_rot"/>
+    <child link="link_z_rot"/>
+    <axis xyz="0 1 0"/>
+    <limit effort="100" lower="-10" upper="10" velocity="100"/>
+  </joint>
+  <joint name="z_rot" type="revolute">
+    <origin rpy="0 0 0" xyz="0 0 0"/>
+    <parent link="link_z_rot"/>
+    <child link="offset_wrench"/>
+    <axis xyz="0 0 1"/>
+    <limit effort="100" lower="-10" upper="10" velocity="100"/>
+  </joint>
+</robot>

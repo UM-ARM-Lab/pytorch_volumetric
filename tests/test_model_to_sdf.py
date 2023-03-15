@@ -21,6 +21,8 @@ logging.basicConfig(level=logging.INFO, force=True,
                     format='[%(levelname)s %(asctime)s %(pathname)s:%(lineno)d] %(message)s',
                     datefmt='%m-%d %H:%M:%S')
 
+TEST_DIR = os.path.dirname(__file__)
+
 
 def test_urdf_to_sdf():
     visualization = "open3d"
@@ -179,7 +181,45 @@ def test_bounding_box():
     p.disconnect()
 
 
+def test_single_link_robot():
+    full_urdf = os.path.join(TEST_DIR, 'offset_wrench.urdf')
+    chain = pk.build_serial_chain_from_urdf(open(full_urdf).read(), "offset_wrench")
+    d = "cuda" if torch.cuda.is_available() else "cpu"
+
+    chain = chain.to(device=d)
+    # paths to the link meshes are specified with their relative path inside the URDF
+    # we need to give them the path prefix as we need their absolute path to load
+    sdf = pv.RobotSDF(chain, path_prefix=TEST_DIR,
+                      link_sdf_cls=pv.cache_link_sdf_factory(resolution=0.001, padding=0.05, device=d))
+    trans_x, trans_y, trans_z = 0.0, 0.0, 0.0
+    rot_x, rot_y, rot_z = 0.0, 0.0, 0.0
+    trans = torch.tensor([trans_x, trans_y, trans_z], device=d)
+    rot = torch.tensor([rot_x, rot_y, rot_z], device=d)
+    H = torch.eye(4, device=d)
+    H[:-1, -1] = trans
+    H[:-1, :-1] = pk.euler_angles_to_matrix(rot, 'XYZ')
+
+    th = torch.cat((trans, rot), dim=0)
+    sdf.set_joint_configuration(th.view(1, -1))
+    query_range = sdf.surface_bounding_box(padding=0.05)
+    # M x 3 points
+    coords, pts = pv.get_coordinates_and_points_in_grid(0.001, query_range, device=sdf.device)
+
+    sdf_val, sdf_grad = sdf(pts)
+    # because we passed in th with size (1, 6), the output is also (1, M) and (1, M, 3) meaning we have a batch of 1
+    sdf_val = sdf_val[0]
+    sdf_grad = sdf_grad[0]
+    near_surface = sdf_val.abs() < 0.001
+    surf_pts = pts[near_surface]
+    surf_norms = sdf_grad[near_surface]
+    pc = o3d.geometry.PointCloud()
+    pc.points = o3d.utility.Vector3dVector(surf_pts.cpu())
+    pc.normals = o3d.utility.Vector3dVector(surf_norms.cpu())
+    o3d.visualization.draw_geometries([pc])
+
+
 if __name__ == "__main__":
     test_urdf_to_sdf()
     test_batch_over_configurations()
     test_bounding_box()
+    test_single_link_robot()
