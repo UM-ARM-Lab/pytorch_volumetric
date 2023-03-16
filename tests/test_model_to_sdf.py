@@ -201,7 +201,7 @@ def test_single_link_robot():
 
     th = torch.cat((trans, rot), dim=0)
     sdf.set_joint_configuration(th.view(1, -1))
-    query_range = sdf.surface_bounding_box(padding=0.05)
+    query_range = sdf.surface_bounding_box(padding=0.05)[0]
     # M x 3 points
     coords, pts = pv.get_coordinates_and_points_in_grid(0.001, query_range, device=sdf.device)
 
@@ -216,6 +216,15 @@ def test_single_link_robot():
     pc.points = o3d.utility.Vector3dVector(surf_pts.cpu())
     pc.normals = o3d.utility.Vector3dVector(surf_norms.cpu())
     o3d.visualization.draw_geometries([pc])
+
+    # test multiple joint configurations
+    N = 5
+    th = th.view(1, -1).repeat(N, 1)
+    sdf.set_joint_configuration(th)
+    query_range = sdf.surface_bounding_box(padding=0.05)
+    assert query_range.shape == (N, 3, 2)
+    for i in range(1, N):
+        assert torch.allclose(query_range[0], query_range[i])
 
 
 if __name__ == "__main__":

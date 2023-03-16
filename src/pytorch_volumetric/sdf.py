@@ -292,14 +292,23 @@ class ComposedSDF(ObjectFrameSDF):
         tsf = self.obj_frame_to_link_frame.inverse()
         for i, sdf in enumerate(self.sdfs):
             pts = sdf.surface_bounding_box(padding=padding)
-            pts = tsf[self.ith_transform_slice(i)].transform_points(pts.to(dtype=tsf.dtype, device=tsf.device).transpose(0, 1))
+            pts = tsf[self.ith_transform_slice(i)].transform_points(
+                pts.to(dtype=tsf.dtype, device=tsf.device).transpose(0, 1))
+            # edge case where the batch is a single element
+            if self.tsf_batch is not None and len(pts.shape) == 2:
+                pts = pts.unsqueeze(0)
             bounds.append(pts)
         bounds = torch.stack(bounds)
 
-        # min over all dimensions apart from the last one
-        mins = bounds.amin(dim=tuple(range(len(bounds.shape) - 1)))
-        maxs = bounds.amax(dim=tuple(range(len(bounds.shape) - 1)))
-        return torch.stack((mins, maxs)).transpose(0, 1)
+        # min over everything except the batch dimensions and the last dimension
+        if self.tsf_batch is not None:
+            # ignore the batch dimension
+            dims = (0,) + tuple(range(2, len(bounds.shape) - 1))
+        else:
+            dims = tuple(range(len(bounds.shape) - 1))
+        mins = bounds.amin(dim=dims)
+        maxs = bounds.amax(dim=dims)
+        return torch.stack((mins, maxs), dim=-1)
 
     def set_transforms(self, tsf: pk.Transform3d, batch_dim=None):
         self.obj_frame_to_link_frame = tsf
