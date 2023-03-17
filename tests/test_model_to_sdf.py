@@ -23,6 +23,8 @@ logging.basicConfig(level=logging.INFO, force=True,
 
 TEST_DIR = os.path.dirname(__file__)
 
+visualize = False
+
 
 def test_urdf_to_sdf():
     visualization = "open3d"
@@ -89,7 +91,8 @@ def test_urdf_to_sdf():
     elif visualization == "open3d":
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(pts[surface].cpu().numpy())
-        o3d.visualization.draw_geometries(pv.get_transformed_meshes(s) + [pcd])
+        if visualize:
+            o3d.visualization.draw_geometries(pv.get_transformed_meshes(s) + [pcd])
 
 
 def test_batch_over_configurations():
@@ -215,16 +218,36 @@ def test_single_link_robot():
     pc = o3d.geometry.PointCloud()
     pc.points = o3d.utility.Vector3dVector(surf_pts.cpu())
     pc.normals = o3d.utility.Vector3dVector(surf_norms.cpu())
-    o3d.visualization.draw_geometries([pc])
+    if visualize:
+        o3d.visualization.draw_geometries([pc])
 
     # test multiple joint configurations
-    N = 5
-    th = th.view(1, -1).repeat(N, 1)
+    B = 5
+    th = th.view(1, -1).repeat(B, 1)
     sdf.set_joint_configuration(th)
     query_range = sdf.surface_bounding_box(padding=0.05)
-    assert query_range.shape == (N, 3, 2)
-    for i in range(1, N):
+    assert query_range.shape == (B, 3, 2)
+    for i in range(1, B):
         assert torch.allclose(query_range[0], query_range[i])
+
+    # test non-batch query when we have a batch of configurations
+    BB = 10
+    N = 100
+    assert surf_pts.shape[0] > BB * N
+    test_pts = surf_pts[:BB * N]
+    sdf_vals, sdf_grads = sdf(test_pts)
+
+    assert sdf_vals.shape == (B, BB * N)
+    assert sdf_grads.shape == (B, BB * N, 3)
+    assert torch.allclose(sdf_vals.abs(), torch.zeros_like(sdf_vals), atol=1e-3)
+
+    # test batch query when we have a batch of configurations
+    batch_pts = test_pts.view(BB, N, 3)
+    # will return with batch order Configuration x Point Query Batch x Num data point
+    batch_sdf_vals, batch_sdf_grads = sdf(batch_pts)
+    assert batch_sdf_vals.shape == (B, BB, N)
+    assert batch_sdf_grads.shape == (B, BB, N, 3)
+    assert torch.allclose(batch_sdf_vals, sdf_vals.view(B, BB, N))
 
 
 if __name__ == "__main__":

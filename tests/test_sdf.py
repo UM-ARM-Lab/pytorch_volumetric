@@ -22,6 +22,12 @@ def test_gradients_at_surface_pts(mesh):
 
     assert torch.allclose(sdf_vals.abs(), torch.zeros_like(sdf_vals), atol=1e-4)
 
+    # test batch query
+    batch_pts = pts.view(10, 100, -1)
+    batch_sdf_vals, batch_sdf_grads = sdf(batch_pts)
+    assert batch_sdf_vals.shape == (10, 100)
+    assert torch.allclose(batch_sdf_vals.abs(), torch.zeros_like(batch_sdf_vals), atol=1e-4)
+
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(pts.cpu())
     pcd.normals = o3d.utility.Vector3dVector(normals.cpu())

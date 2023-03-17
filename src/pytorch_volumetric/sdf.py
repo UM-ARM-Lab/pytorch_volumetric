@@ -334,14 +334,19 @@ class ComposedSDF(ObjectFrameSDF):
 
     def __call__(self, points_in_object_frame):
         pts_shape = points_in_object_frame.shape
+        # flatten it for the transform
+        points_in_object_frame = points_in_object_frame.view(-1, 3)
+        flat_shape = points_in_object_frame.shape
         S = len(self.sdfs)
         # pts[i] are now points in the ith SDF's frame
         pts = self.obj_frame_to_link_frame.transform_points(points_in_object_frame)
+        # S x B x N x 3
         if self.tsf_batch is not None:
-            pts = pts.reshape(S, *self.tsf_batch, *pts_shape)
+            pts = pts.reshape(S, *self.tsf_batch, *flat_shape)
         sdfv = []
         sdfg = []
         for i, sdf in enumerate(self.sdfs):
+            # B x N for v and B x N x 3 for g
             v, g = sdf(pts[i])
             # need to transform the gradient back to the object frame
             g = self.link_frame_to_obj_frame[i].transform_normals(g)
@@ -355,15 +360,18 @@ class ComposedSDF(ObjectFrameSDF):
         # easier solution for flattening
         v = sdfv.reshape(S, -1)
         g = sdfg.reshape(S, -1, 3)
+        # ensure S is the first dimension and take min across S (the different links)
         closest = torch.argmin(v, 0)
 
         all = torch.arange(0, v.shape[1])
+        # B*N for vv and B*N x 3 for gg
         vv = v[closest, all]
         gg = g[closest, all]
 
         if self.tsf_batch is not None:
-            vv = vv.reshape(*self.tsf_batch, -1)
-            gg = gg.reshape(*self.tsf_batch, -1, 3)
+            # retrieve the original query points batch dimensions - note that they are after configuration batch
+            vv = vv.reshape(*self.tsf_batch, *pts_shape[:-1])
+            gg = gg.reshape(*self.tsf_batch, *pts_shape[:-1], 3)
 
         return vv, gg
 
