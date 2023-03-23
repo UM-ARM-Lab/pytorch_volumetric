@@ -18,13 +18,14 @@ def test_chamfer_distance(mesh):
     device = d
     dtype = torch.float
     B = 300
+    N = 1000
     seed(3)
 
     # press n to visualize the normals / gradients
     obj = pv.MeshObjectFactory(os.path.join(TEST_DIR, mesh))
 
     # sample points on the obj mesh surface uniformly
-    pts, normals, _ = sample_mesh_points(obj, name=mesh, num_points=1000, device=d, dtype=dtype)
+    pts, normals, _ = sample_mesh_points(obj, name=mesh, num_points=N, device=d, dtype=dtype)
 
     # sample a random transform
     gt_tf = pk.Transform3d(pos=torch.randn(3, device=d), rot=pk.random_rotation(device=d), device=d)
@@ -38,20 +39,34 @@ def test_chamfer_distance(mesh):
     assert torch.allclose(err, torch.zeros_like(err), atol=1e-4)
 
     # randomly pertrub the transform
-    radian_sigma = 0.1
-    translation_sigma = 0.1
-    world_to_object_perturbed = torch.eye(4, dtype=dtype, device=device).repeat(B, 1, 1)
+    perturbed_tf = gt_tf.sample_perturbations(B, radian_sigma=0.1, translation_sigma=0.1)
+    world_to_object_perturbed = perturbed_tf.inverse().get_matrix()
 
-    delta_R = torch.randn((B, 3), dtype=dtype, device=device) * radian_sigma
-    delta_R = pk.axis_angle_to_matrix(delta_R)
-    world_to_object_perturbed[:, :3, :3] = delta_R @ world_to_object[:, :3, :3]
-    world_to_object_perturbed[:, :3, 3] = world_to_object[:, :3, 3]
+    # ChamferDistance gives the sum of all the distances while we take their mean, so we need to multiply by N
+    err = pv.batch_chamfer_dist(world_to_object_perturbed, pts_world, obj, scale=1) * N
+    # compare the error to the chamfer distance between the transformed points and the original points
+    perturbed_pts = perturbed_tf.transform_points(pts)
 
-    delta_t = torch.randn((B, 3), dtype=dtype, device=device) * translation_sigma
-    world_to_object_perturbed[:, :3, 3] += delta_t
+    try:
+        from chamferdist import ChamferDistance
+        d = ChamferDistance()
+        gt_dist = d(pts_world.repeat(B, 1, 1), perturbed_pts, reduction=None)
+        # gt_dist_r = d(pts_world.repeat(B, 1, 1), perturbed_tf.transform_points(pts), reduction=None, reverse=True)
+        # gt_dist_b = 0.5 * d(pts_world.repeat(B, 1, 1), perturbed_tf.transform_points(pts), reduction=None, bidirectional=True)
+        # there are some differences because ours compares the unidirectional chamfer distance to a mesh vs point cloud
+        # they are always overestimating the distance due to not finding the actual closest point
+        assert torch.all(err < gt_dist)
+        assert torch.all(gt_dist - err < 0.05 * gt_dist)
+    except ImportError:
+        print("pip install chamferdist to test against an accelerated implementation of chamfer distance")
+
+    # compare against a manual chamfer distance calculation
+    all_dists = torch.cdist(pts_world, perturbed_pts)
+    gt_dist_manual = torch.min(all_dists, dim=2).values.square().sum(dim=1)
+    assert torch.all(err < gt_dist_manual)
+    assert torch.all(gt_dist_manual - err < 0.05 * gt_dist_manual)
 
     # compare the chamfer distance to the matrix distance of the transform (norm of their difference)
-    err = pv.batch_chamfer_dist(world_to_object_perturbed, pts_world, obj)
     # use the p=2 induced vector norm (spectral norm)
     mat_diff = world_to_object_perturbed - world_to_object
     # get the max singular value of the matrix
@@ -71,6 +86,53 @@ def test_chamfer_distance(mesh):
         plt.show()
 
 
+def test_plausible_diversity(mesh):
+    d = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = torch.float
+    B = 10
+    tol = 1e-4
+    seed(3)
+
+    # press n to visualize the normals / gradients
+    obj = pv.MeshObjectFactory(os.path.join(TEST_DIR, mesh))
+
+    # sample a random transform
+    gt_tf = pk.Transform3d(pos=torch.randn(3, device=d), rot=pk.random_rotation(device=d), dtype=dtype, device=d)
+    # sample perturbations around it to get a set of plausible gt transforms
+    gt_tf = gt_tf.sample_perturbations(B, radian_sigma=0.05, translation_sigma=0.01)
+
+    # plausible diversity of itself should be 0
+    pd = pv.PlausibleDiversity(obj)
+    pd_ret = pd(gt_tf.inverse().get_matrix(), gt_tf.get_matrix())
+    assert pd_ret.plausibility < tol
+    assert pd_ret.coverage < tol
+
+    # removing some transforms should keep plausibility at 0, but increase coverage error
+    partial_tf = pk.Transform3d(matrix=gt_tf.get_matrix()[:B // 2])
+    pd_ret = pd(partial_tf.inverse().get_matrix(), gt_tf.get_matrix(), bidirectional=True)
+    assert pd_ret.plausibility < tol
+    assert pd_ret.coverage > tol
+
+    # # compare the computed distances against the ground truth
+    # pts = pd.model_points_eval
+    # # transform the points using both sets of transforms
+    # pts_gt = gt_tf.transform_points(pts)
+    # pts_partial = partial_tf.transform_points(pts)
+    # # compute the chamfer distance between the transformed points
+
+    # going the other way should have the opposite effect
+    pd_ret_other = pd(gt_tf.inverse().get_matrix(), partial_tf.get_matrix(), bidirectional=True)
+    assert pd_ret_other.plausibility > tol
+    assert pd_ret_other.coverage < tol
+
+    # should also be symmetric when created as bidirectional
+    # could still have some numerical error due to inverting the matrix
+    assert torch.allclose(pd_ret.plausibility,  pd_ret_other.coverage)
+    assert torch.allclose(pd_ret.coverage, pd_ret_other.plausibility, rtol=0.06)
+
+
 if __name__ == "__main__":
     test_chamfer_distance("probe.obj")
     test_chamfer_distance("offset_wrench_nogrip.obj")
+    test_plausible_diversity("probe.obj")
+    test_plausible_diversity("offset_wrench_nogrip.obj")

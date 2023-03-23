@@ -1,4 +1,4 @@
-from pytorch_volumetric.chamfer import batch_chamfer_dist
+from pytorch_volumetric.chamfer import batch_chamfer_dist, PlausibleDiversity
 from pytorch_volumetric.sdf import sample_mesh_points, ObjectFrameSDF, MeshSDF, CachedSDF, ComposedSDF, SDFQuery, \
     ObjectFactory, MeshObjectFactory
 from pytorch_volumetric.voxel import Voxels, VoxelGrid, VoxelSet, ExpandingVoxelGrid, get_divisible_range_by_resolution, \
