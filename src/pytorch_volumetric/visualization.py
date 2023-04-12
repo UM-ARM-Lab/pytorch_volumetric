@@ -1,5 +1,4 @@
 import copy
-import pdb
 
 from pytorch_volumetric import voxel
 from pytorch_volumetric import sdf
