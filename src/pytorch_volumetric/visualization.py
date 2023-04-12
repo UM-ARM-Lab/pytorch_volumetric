@@ -1,4 +1,5 @@
 import copy
+import pdb
 
 from pytorch_volumetric import voxel
 from pytorch_volumetric import sdf
@@ -55,6 +56,7 @@ def draw_sdf_slice(s: sdf.ObjectFrameSDF, query_range, resolution=0.01, interior
     cset1 = ax.contourf(x, z, v, norm=norm, cmap=cmap)
     cset2 = ax.contour(x, z, v, colors='k', levels=[0], linestyles='dashed')
     ax.clabel(cset2, cset2.levels, inline=True, fontsize=13, fmt=fmt)
+    plt.colorbar(cset1)
     # fig = plt.gcf()
     # fig.canvas.draw()
     plt.draw()
