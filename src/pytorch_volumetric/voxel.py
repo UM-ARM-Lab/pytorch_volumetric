@@ -80,23 +80,24 @@ class VoxelGrid(Voxels):
 
 class ExpandingVoxelGrid(VoxelGrid):
     def __setitem__(self, pts, value):
-        # if this query goes outside the range, expand the range in increments of the resolution
-        min = pts.min(dim=0).values
-        max = pts.max(dim=0).values
-        range_per_dim = copy.deepcopy(self.range_per_dim)
-        for dim in range(len(min)):
-            over = (max[dim] - self.range_per_dim[dim][1]).item()
-            under = (self.range_per_dim[dim][0] - min[dim]).item()
-            # adjust in increments of resolution
-            if over > 0:
-                range_per_dim[dim][1] += math.ceil(over / self.resolution) * self.resolution
-            if under > 0:
-                range_per_dim[dim][0] -= math.ceil(under / self.resolution) * self.resolution
-        if not np.allclose(range_per_dim, self.range_per_dim):
-            # transfer over values
-            known_pos, known_values = self.get_known_pos_and_values()
-            self._create_voxels(self.resolution, range_per_dim)
-            super().__setitem__(known_pos, known_values)
+        if pts.numel() > 0:
+            # if this query goes outside the range, expand the range in increments of the resolution
+            min = pts.min(dim=0).values
+            max = pts.max(dim=0).values
+            range_per_dim = copy.deepcopy(self.range_per_dim)
+            for dim in range(len(min)):
+                over = (max[dim] - self.range_per_dim[dim][1]).item()
+                under = (self.range_per_dim[dim][0] - min[dim]).item()
+                # adjust in increments of resolution
+                if over > 0:
+                    range_per_dim[dim][1] += math.ceil(over / self.resolution) * self.resolution
+                if under > 0:
+                    range_per_dim[dim][0] -= math.ceil(under / self.resolution) * self.resolution
+            if not np.allclose(range_per_dim, self.range_per_dim):
+                # transfer over values
+                known_pos, known_values = self.get_known_pos_and_values()
+                self._create_voxels(self.resolution, range_per_dim)
+                super().__setitem__(known_pos, known_values)
 
         return super().__setitem__(pts, value)
 
