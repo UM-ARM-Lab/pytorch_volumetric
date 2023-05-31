@@ -26,8 +26,8 @@ class SDFQuery(NamedTuple):
 
 
 class ObjectFactory(abc.ABC):
-    def __init__(self, name, scale=1.0, vis_frame_pos=(0, 0, 0), vis_frame_rot=(0, 0, 0, 1),
-                 plausible_suboptimality=0.001, **kwargs):
+    def __init__(self, name='', scale=1.0, vis_frame_pos=(0, 0, 0), vis_frame_rot=(0, 0, 0, 1),
+                 plausible_suboptimality=0.001, mesh=None, **kwargs):
         self.name = name
         self.scale = scale
         # frame from model's base frame to the simulation's use of the model
@@ -37,10 +37,11 @@ class ObjectFactory(abc.ABC):
         self.plausible_suboptimality = plausible_suboptimality
 
         # use external mesh library to compute closest point for non-convex meshes
-        self._mesh = None
+        self._mesh = mesh
         self._mesht = None
         self._raycasting_scene = None
         self._face_normals = None
+        self.precompute_sdf()
 
     @abc.abstractmethod
     def make_collision_obj(self, z, rgba=None):
@@ -60,8 +61,6 @@ class ObjectFactory(abc.ABC):
                             object_id=object_id, vis_frame_pos=frame_pos, vis_frame_rot=self.vis_frame_rot)
 
     def bounding_box(self, padding=0.):
-        if self._mesh is None:
-            self.precompute_sdf()
 
         aabb = self._mesh.get_axis_aligned_bounding_box()
         world_min = aabb.get_min_bound()
@@ -74,10 +73,12 @@ class ObjectFactory(abc.ABC):
 
     def precompute_sdf(self):
         # scale mesh the approrpiate amount
-        full_path = self.get_mesh_high_poly_resource_filename()
-        if not os.path.exists(full_path):
-            raise RuntimeError(f"Expected mesh file does not exist: {full_path}")
-        self._mesh = o3d.io.read_triangle_mesh(full_path).scale(self.scale, [0, 0, 0])
+        if self._mesh is None:
+            full_path = self.get_mesh_high_poly_resource_filename()
+            if not os.path.exists(full_path):
+                raise RuntimeError(f"Expected mesh file does not exist: {full_path}")
+            self._mesh = o3d.io.read_triangle_mesh(full_path)
+        self._mesh = self._mesh.scale(self.scale, center=[0, 0, 0])
         # convert from mesh object frame to simulator object frame
         x, y, z, w = self.vis_frame_rot
         self._mesh = self._mesh.rotate(o3d.geometry.get_rotation_matrix_from_quaternion((w, x, y, z)),
@@ -92,8 +93,6 @@ class ObjectFactory(abc.ABC):
 
     @tensor_utils.handle_batch_input
     def _do_object_frame_closest_point(self, points_in_object_frame, compute_normal=False):
-        if self._mesh is None:
-            self.precompute_sdf()
 
         if torch.is_tensor(points_in_object_frame):
             dtype = points_in_object_frame.dtype
@@ -157,7 +156,7 @@ class ObjectFactory(abc.ABC):
 
 
 class MeshObjectFactory(ObjectFactory):
-    def __init__(self, mesh_name, path_prefix='', **kwargs):
+    def __init__(self, mesh_name='', path_prefix='', **kwargs):
         self.path_prefix = path_prefix
         # whether to strip the package:// prefix from the mesh name, for example if we are loading a mesh manually
         # with a path prefix
