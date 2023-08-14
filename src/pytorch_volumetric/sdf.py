@@ -29,7 +29,7 @@ class ObjectFactory(abc.ABC):
     def __init__(self, name, scale=1.0, vis_frame_pos=(0, 0, 0), vis_frame_rot=(0, 0, 0, 1),
                  plausible_suboptimality=0.001, **kwargs):
         self.name = name
-        self.scale = scale if scale is not None else 1.0
+        self.scale = scale
         # frame from model's base frame to the simulation's use of the model
         self.vis_frame_pos = vis_frame_pos
         self.vis_frame_rot = vis_frame_rot
@@ -77,10 +77,7 @@ class ObjectFactory(abc.ABC):
         full_path = self.get_mesh_high_poly_resource_filename()
         if not os.path.exists(full_path):
             raise RuntimeError(f"Expected mesh file does not exist: {full_path}")
-        self._mesh = o3d.io.read_triangle_mesh(full_path)
-        scale_transform = np.eye(4)
-        np.fill_diagonal(scale_transform[:3, :3], self.scale)
-        self._mesh.transform(scale_transform)
+        self._mesh = o3d.io.read_triangle_mesh(full_path).scale(self.scale, [0, 0, 0])
         # convert from mesh object frame to simulator object frame
         x, y, z, w = self.vis_frame_rot
         self._mesh = self._mesh.rotate(o3d.geometry.get_rotation_matrix_from_quaternion((w, x, y, z)),
@@ -166,7 +163,7 @@ class MeshObjectFactory(ObjectFactory):
         # with a path prefix
         self.strip_package_prefix = path_prefix != ''
         # specify ranges=None to infer the range from the object's bounding box
-        super(MeshObjectFactory, self).__init__(mesh_name,**kwargs)
+        super(MeshObjectFactory, self).__init__(mesh_name, **kwargs)
 
     def make_collision_obj(self, z, rgba=None):
         return None, None
