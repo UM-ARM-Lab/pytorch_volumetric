@@ -45,7 +45,9 @@ class RobotSDF(sdf.ObjectFrameSDF):
             for link_vis in frame.link.visuals:
                 if link_vis.geom_type == "mesh":
                     logger.info(f"{frame.link.name} offset {link_vis.offset}")
-                    link_obj = sdf.MeshObjectFactory(link_vis.geom_param, path_prefix=path_prefix)
+                    link_obj = sdf.MeshObjectFactory(link_vis.geom_param[0],
+                                                     scale=link_vis.geom_param[1],
+                                                     path_prefix=path_prefix)
                     link_sdf = link_sdf_cls(link_obj)
                     self.sdf_to_link_name.append(frame.link.name)
                     sdfs.append(link_sdf)
