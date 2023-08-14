@@ -13,7 +13,7 @@ TEST_DIR = os.path.dirname(__file__)
 visualize = True
 
 
-def test_chamfer_distance(mesh):
+def do_test_chamfer_distance(mesh):
     d = "cuda" if torch.cuda.is_available() else "cpu"
     device = d
     dtype = torch.float
@@ -86,7 +86,7 @@ def test_chamfer_distance(mesh):
         plt.show()
 
 
-def test_plausible_diversity(mesh):
+def do_test_plausible_diversity(mesh):
     d = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.float
     B = 10
@@ -127,12 +127,20 @@ def test_plausible_diversity(mesh):
 
     # should also be symmetric when created as bidirectional
     # could still have some numerical error due to inverting the matrix
-    assert torch.allclose(pd_ret.plausibility,  pd_ret_other.coverage)
+    assert torch.allclose(pd_ret.plausibility, pd_ret_other.coverage)
     assert torch.allclose(pd_ret.coverage, pd_ret_other.plausibility, rtol=0.06)
 
 
+def test_chamfer_distance():
+    do_test_chamfer_distance("probe.obj")
+    do_test_chamfer_distance("offset_wrench_nogrip.obj")
+
+
+def test_plausible_diversity():
+    do_test_plausible_diversity("probe.obj")
+    do_test_plausible_diversity("offset_wrench_nogrip.obj")
+
+
 if __name__ == "__main__":
-    test_chamfer_distance("probe.obj")
-    test_chamfer_distance("offset_wrench_nogrip.obj")
-    test_plausible_diversity("probe.obj")
-    test_plausible_diversity("offset_wrench_nogrip.obj")
+    test_chamfer_distance()
+    test_plausible_diversity()
