@@ -43,7 +43,7 @@ def batch_chamfer_dist(world_to_object: torch.tensor, model_points_world_frame_e
             pos, rot = matrix_to_pos_rot(m[b])
             obj_factory.draw_mesh(vis, "chamfer evaluation", (pos, rot), rgba=(0, 0.1, 0.8, 0.1),
                                   object_id=vis.USE_DEFAULT_ID_FOR_NAME)
-            vis.draw_point("avgerr", [0, 0, 0], (1, 0, 0), label=f"avgerr: {round(errors_per_batch[b].item())}")
+            # vis.draw_point("avgerr", [0, 0, 0], (1, 0, 0), label=f"avgerr: {round(errors_per_batch[b].item())}")
 
             if print_err:
                 for i in range(eval_num_points):

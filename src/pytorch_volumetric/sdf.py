@@ -10,6 +10,7 @@ import open3d as o3d
 import torch
 from arm_pytorch_utilities import tensor_utils, rand
 from multidim_indexing import torch_view
+from functools import partial
 
 from pytorch_volumetric.voxel import VoxelGrid, get_divisible_range_by_resolution, get_coordinates_and_points_in_grid
 import pytorch_kinematics as pk
@@ -41,6 +42,12 @@ class ObjectFactory(abc.ABC):
         self._mesht = None
         self._raycasting_scene = None
         self._face_normals = None
+
+    def __reduce__(self):
+        return partial(self.__class__, scale=self.scale, vis_frame_pos=self.vis_frame_pos,
+                       vis_frame_rot=self.vis_frame_rot,
+                       plausible_suboptimality=self.plausible_suboptimality, **self.other_load_kwargs), \
+            (self.name,)
 
     @abc.abstractmethod
     def make_collision_obj(self, z, rgba=None):
@@ -164,6 +171,12 @@ class MeshObjectFactory(ObjectFactory):
         self.strip_package_prefix = path_prefix != ''
         # specify ranges=None to infer the range from the object's bounding box
         super(MeshObjectFactory, self).__init__(mesh_name, **kwargs)
+
+    def __reduce__(self):
+        return partial(self.__class__, path_prefix=self.path_prefix, scale=self.scale, vis_frame_pos=self.vis_frame_pos,
+                       vis_frame_rot=self.vis_frame_rot,
+                       plausible_suboptimality=self.plausible_suboptimality, **self.other_load_kwargs), \
+            (self.name,)
 
     def make_collision_obj(self, z, rgba=None):
         return None, None

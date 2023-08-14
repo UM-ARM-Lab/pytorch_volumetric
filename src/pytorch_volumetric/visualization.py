@@ -1,5 +1,7 @@
 import copy
 
+import torch
+
 from pytorch_volumetric import voxel
 from pytorch_volumetric import sdf
 from pytorch_volumetric import model_to_sdf
@@ -30,6 +32,8 @@ def draw_sdf_slice(s: sdf.ObjectFrameSDF, query_range, resolution=0.01, interior
     :return:
     """
     coords, pts = voxel.get_coordinates_and_points_in_grid(resolution, query_range, device=device)
+    # add a small amount of noise to avoid querying regular grid
+    pts += torch.randn_like(pts) * 1e-6
     dim_labels = ['x', 'y', 'z']
     slice_dim = None
     for i in range(len(dim_labels)):
@@ -59,7 +63,7 @@ def draw_sdf_slice(s: sdf.ObjectFrameSDF, query_range, resolution=0.01, interior
     # fig.canvas.draw()
     plt.draw()
     plt.pause(0.005)
-    return sdf_val, sdf_grad, pts, ax, cset1, cset2
+    return sdf_val, sdf_grad, pts, ax, cset1, cset2, v
 
 
 def get_transformed_meshes(robot_sdf: model_to_sdf.RobotSDF, obj_to_world_tsf=None):

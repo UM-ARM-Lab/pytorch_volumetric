@@ -57,6 +57,36 @@ def do_test_gradients_at_surface_pts(mesh):
     pcd.colors = o3d.utility.Vector3dVector(colors.cpu())
     o3d.visualization.draw_geometries([sdf.obj_factory._mesh, pcd])
 
+def test_compose_sdf():
+    import pytorch_kinematics as pk
+    d = "cuda" if torch.cuda.is_available() else "cpu"
+
+    obj = pv.MeshObjectFactory("YcbPowerDrill/textured_simple_reoriented.obj")
+
+    # 2 drills in the world
+    sdf1 = pv.MeshSDF(obj)
+    sdf2 = pv.MeshSDF(obj)
+    # need to specify the transform of each SDF frame
+    tsf1 = pk.Translate(0.1, 0, 0)
+    tsf2 = pk.Translate(-0.2, 0, 0.2)
+    sdf = pv.ComposedSDF([sdf1, sdf2], tsf1.stack(tsf2))
+    # sample points in the bounding box
+
+    coords, pts = pv.get_coordinates_and_points_in_grid(0.002, obj.bounding_box(0.01), device=d)
+    # randomly downsample to some number of points
+    pts = pts[torch.randperm(len(pts))[:1000]]
+    # query the sdf value and gradient at the sampled points
+    sdf_vals, sdf_grads = sdf(pts)
+    # visualize the sdf value and gradient at the sampled points
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(pts.cpu())
+    pcd.normals = o3d.utility.Vector3dVector(sdf_grads.cpu())
+    colors = torch.zeros_like(sdf_vals).view(-1, 1).repeat(1, 3)
+    colors[:, 0] = (sdf_vals - sdf_vals.min()) / (sdf_vals.max() - sdf_vals.min())
+    colors[:, 1] = 1
+    pcd.colors = o3d.utility.Vector3dVector(colors.cpu())
+    o3d.visualization.draw_geometries([sdf.obj_factory._mesh, pcd])
+
 
 def test_gradients_at_surface_pts():
     do_test_gradients_at_surface_pts("probe.obj")
