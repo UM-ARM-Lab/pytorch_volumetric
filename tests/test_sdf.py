@@ -7,7 +7,7 @@ from pytorch_volumetric import sample_mesh_points
 TEST_DIR = os.path.dirname(__file__)
 
 
-def test_gradients_at_surface_pts(mesh):
+def do_test_gradients_at_surface_pts(mesh):
     d = "cuda" if torch.cuda.is_available() else "cpu"
 
     # press n to visualize the normals / gradients
@@ -58,6 +58,10 @@ def test_gradients_at_surface_pts(mesh):
     o3d.visualization.draw_geometries([sdf.obj_factory._mesh, pcd])
 
 
+def test_gradients_at_surface_pts():
+    do_test_gradients_at_surface_pts("probe.obj")
+    do_test_gradients_at_surface_pts("offset_wrench_nogrip.obj")
+
+
 if __name__ == "__main__":
-    test_gradients_at_surface_pts("probe.obj")
-    test_gradients_at_surface_pts("offset_wrench_nogrip.obj")
+    test_gradients_at_surface_pts()
