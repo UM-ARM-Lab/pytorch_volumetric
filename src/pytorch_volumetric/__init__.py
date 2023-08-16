@@ -5,3 +5,4 @@ from pytorch_volumetric.voxel import Voxels, VoxelGrid, VoxelSet, ExpandingVoxel
     get_coordinates_and_points_in_grid
 from pytorch_volumetric.model_to_sdf import RobotSDF, cache_link_sdf_factory, aabb_to_ordered_end_points
 from pytorch_volumetric.visualization import draw_sdf_slice, get_transformed_meshes
+from pytorch_volumetric.robot_scene import RobotScene

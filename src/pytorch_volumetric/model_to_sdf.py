@@ -45,6 +45,7 @@ class RobotSDF(sdf.ObjectFrameSDF):
             for link_vis in frame.link.visuals:
                 if link_vis.geom_type == "mesh":
                     logger.info(f"{frame.link.name} offset {link_vis.offset}")
+                    print(frame.link.name, link_vis.geom_param)
                     link_obj = sdf.MeshObjectFactory(link_vis.geom_param[0],
                                                      scale=link_vis.geom_param[1],
                                                      path_prefix=path_prefix)
@@ -54,7 +55,6 @@ class RobotSDF(sdf.ObjectFrameSDF):
                     offsets.append(link_vis.offset)
                 else:
                     logger.warning(f"Cannot handle non-mesh link visual type {link_vis}")
-
         self.offset_transforms = offsets[0].stack(*offsets[1:]).to(device=self.device, dtype=self.dtype)
         self.sdf = sdf.ComposedSDF(sdfs, self.object_to_link_frames)
         self.set_joint_configuration(default_joint_config)
@@ -84,6 +84,7 @@ class RobotSDF(sdf.ObjectFrameSDF):
         Set the joint configuration of the robot
         :param joint_config: [A x] M optionally arbitrarily batched joint configurations. There are M joints; A can be
         any number of batched dimensions.
+
         :return:
         """
         M = len(self.joint_names)
@@ -104,9 +105,19 @@ class RobotSDF(sdf.ObjectFrameSDF):
         offset_tsf = self.offset_transforms.inverse()
         if self.configuration_batch is not None:
             offset_tsf = pk.Transform3d(matrix=offset_tsf.get_matrix().repeat(*self.configuration_batch, 1, 1))
-        self.object_to_link_frames = offset_tsf.compose(pk.Transform3d(matrix=torch.cat(tsfs).inverse()))
+
+        tsfs = torch.stack(tsfs, dim=1).reshape(-1, 4, 4)
+        self.object_to_link_frames = offset_tsf.compose(pk.Transform3d(matrix=tsfs.inverse()))
         if self.sdf is not None:
             self.sdf.set_transforms(self.object_to_link_frames, batch_dim=self.configuration_batch)
+
+    def get_link_obj_factory(self, link_name) -> sdf.ObjectFactory:
+        """
+        Get the object factory for the given link
+        :param link_name: name of the link
+        :return: object factory for the link
+        """
+        return self.sdf.sdfs[self.sdf_to_link_name.index(link_name)].obj_factory
 
     def __call__(self, points_in_object_frame):
         """
