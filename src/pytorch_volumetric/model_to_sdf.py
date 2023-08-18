@@ -103,7 +103,12 @@ class RobotSDF(sdf.ObjectFrameSDF):
         # make offset transforms have compatible batch dimensions
         offset_tsf = self.offset_transforms.inverse()
         if self.configuration_batch is not None:
-            offset_tsf = pk.Transform3d(matrix=offset_tsf.get_matrix().repeat(*self.configuration_batch, 1, 1))
+            # must be of shape (num_links, *self.configuration_batch, 4, 4) before flattening
+            expand_dims = (None,) * len(self.configuration_batch)
+            offset_tsf_mat = offset_tsf.get_matrix()[(slice(None),) + expand_dims]
+            offset_tsf_mat = offset_tsf_mat.repeat(1, *self.configuration_batch, 1, 1)
+            offset_tsf = pk.Transform3d(matrix=offset_tsf_mat.reshape(-1, 4, 4))
+
         tsfs = torch.cat(tsfs)
         self.object_to_link_frames = offset_tsf.compose(pk.Transform3d(matrix=tsfs.inverse()))
         if self.sdf is not None:
