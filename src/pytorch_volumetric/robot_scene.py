@@ -66,9 +66,14 @@ class RobotScene:
         self.robot_sdf.set_joint_configuration(q)
         tfs = self.robot_sdf.sdf.obj_frame_to_link_frame.inverse()
 
-        batched_query_points = self.robot_query_points.repeat(B, 1, 1)
-        pts = tfs.transform_points(batched_query_points)
-        pts = self.scene_transform.inverse().transform_points(pts).reshape(B, -1, 3)
+        # Convention in RobotSDF is that transforms are shape (num_links, num_configs, 4, 4) before flattening
+        # the first two dimensions. Thus points need to be (num_links, num_configs, num_points, 3)
+        batched_query_points = self.robot_query_points.unsqueeze(1).repeat(1, B, 1, 1)
+        pts = tfs.transform_points(batched_query_points.reshape(-1, self.points_per_link, 3))
+        pts = self.scene_transform.inverse().transform_points(pts)
+        # Now we have transformed points, want to permute to be (num_configs, num_links*num_points, 3)
+        pts = pts.reshape(-1, B, self.points_per_link, 3)
+        pts = pts.permute(1, 0, 2, 3).reshape(B, -1, 3)
         sdf_vals, sdf_grads = self.scene_sdf(pts)
 
         # use softmin to get gradient but use hard min for actual sdf value
@@ -106,8 +111,15 @@ class RobotScene:
 
         self.robot_sdf.set_joint_configuration(q)
         tfs = self.robot_sdf.sdf.obj_frame_to_link_frame.inverse()
-        pts = tfs.transform_points(self.robot_query_points.repeat(B, 1, 1)).reshape(B, -1, 3)
-        sdf_vals, sdf_grads = self.scene_sdf(pts)
+        # Convention in RobotSDF is that transforms are shape (num_links, num_configs, 4, 4) before flattening
+        # the first two dimensions. Thus points need to be (num_links, num_configs, num_points, 3)
+        batched_query_points = self.robot_query_points.unsqueeze(1).repeat(1, B, 1, 1)
+        pts = tfs.transform_points(batched_query_points.reshape(-1, self.points_per_link, 3))
+        pts = self.scene_transform.inverse().transform_points(pts)
+        # Now we have transformed points, want to permute to be (num_configs, num_links*num_points, 3)
+        pts = pts.reshape(-1, B, self.points_per_link, 3)
+        pts = pts.permute(1, 0, 2, 3).reshape(B, -1, 3)
+        sdf_vals, sdf_grads = self.robot_sdf(pts)
 
         # only consider gradient on points that are in collision
         # scale sdf grads by magnitude of sdf value

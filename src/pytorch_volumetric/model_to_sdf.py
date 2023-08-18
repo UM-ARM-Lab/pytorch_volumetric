@@ -45,7 +45,6 @@ class RobotSDF(sdf.ObjectFrameSDF):
             for link_vis in frame.link.visuals:
                 if link_vis.geom_type == "mesh":
                     logger.info(f"{frame.link.name} offset {link_vis.offset}")
-                    print(frame.link.name, link_vis.geom_param)
                     link_obj = sdf.MeshObjectFactory(link_vis.geom_param[0],
                                                      scale=link_vis.geom_param[1],
                                                      path_prefix=path_prefix)
@@ -104,9 +103,13 @@ class RobotSDF(sdf.ObjectFrameSDF):
         # make offset transforms have compatible batch dimensions
         offset_tsf = self.offset_transforms.inverse()
         if self.configuration_batch is not None:
-            offset_tsf = pk.Transform3d(matrix=offset_tsf.get_matrix().repeat(*self.configuration_batch, 1, 1))
+            # must be of shape (num_links, *self.configuration_batch, 4, 4) before flattening
+            expand_dims = (None,) * len(self.configuration_batch)
+            offset_tsf_mat = offset_tsf.get_matrix()[(slice(None),) + expand_dims]
+            offset_tsf_mat = offset_tsf_mat.repeat(1, *self.configuration_batch, 1, 1)
+            offset_tsf = pk.Transform3d(matrix=offset_tsf_mat.reshape(-1, 4, 4))
 
-        tsfs = torch.stack(tsfs, dim=1).reshape(-1, 4, 4)
+        tsfs = torch.cat(tsfs)
         self.object_to_link_frames = offset_tsf.compose(pk.Transform3d(matrix=tsfs.inverse()))
         if self.sdf is not None:
             self.sdf.set_transforms(self.object_to_link_frames, batch_dim=self.configuration_batch)
