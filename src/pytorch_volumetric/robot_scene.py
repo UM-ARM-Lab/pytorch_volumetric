@@ -66,41 +66,25 @@ class RobotScene:
         self.robot_sdf.set_joint_configuration(q)
         tfs = self.robot_sdf.sdf.obj_frame_to_link_frame.inverse()
 
-
         batched_query_points = self.robot_query_points.repeat(B, 1, 1)
-
         pts = tfs.transform_points(batched_query_points)
-        t = tfs.get_matrix().reshape(B, -1, 4, 4)
         pts = self.scene_transform.inverse().transform_points(pts).reshape(B, -1, 3)
         sdf_vals, sdf_grads = self.scene_sdf(pts)
-        # only consider gradient on points that are in collision
-        # scale sdf grads by magnitude of sdf value
-        # sdf_vals = torch.where(sdf_vals < self.threshold, sdf_vals, torch.zeros_like(sdf_vals))
-        # sdf_grads = sdf_grads * sdf_vals.unsqueeze(-1)
 
         # use softmin to get gradient but use hard min for actual sdf value
         h = torch.softmax(-self.softmin_T * sdf_vals, dim=1)
-        #sdf_val = torch.min(sdf_vals, dim=1).values#torch.sum(h * sdf_vals, dim=1)
         sdf_val = torch.min(sdf_vals, dim=1).values
 
         if compute_gradient:
             # Get gradient of softmin
-            #diagonal_mask = torch.diag_embed(torch.ones_like(h))
-            #h_grad = diagonal_mask * (h_grad - torch.diag_embed(h)) + (1 - diagonal_mask) * h_grad
             h_grad = h * (h - 1)
             pts_grad_1 = (h_grad * sdf_vals).unsqueeze(-1) * sdf_grads
             pts_grad_2 = h.unsqueeze(-1) * sdf_grads
-            #print(pts_grad_1)
-            #print(pts_grad_2)
-
             pts_grad = (pts_grad_1 + pts_grad_2)
-            #pts_grad = torch.where(sdf_vals.unsqueeze(-1) < self.threshold, sdf_grads, 0.01 * sdf_grads)
             pts.backward(pts_grad)
             q_grad = q.grad
-            #print(q_grad)
             self.robot_query_points.detach_()
             self._query_point_mask.requires_grad_(False)
-            #q.requires_grad_(False)
             q.detach_()
             return sdf_val, q_grad.detach()
 
@@ -122,7 +106,6 @@ class RobotScene:
 
         self.robot_sdf.set_joint_configuration(q)
         tfs = self.robot_sdf.sdf.obj_frame_to_link_frame.inverse()
-        tfs = self.robot_sdf.sdf.obj_frame_to_link_frame.inverse()
         pts = tfs.transform_points(self.robot_query_points.repeat(B, 1, 1)).reshape(B, -1, 3)
         sdf_vals, sdf_grads = self.scene_sdf(pts)
 
@@ -135,21 +118,17 @@ class RobotScene:
         sdf_val = torch.sum(h * sdf_vals, dim=1)
 
         if compute_gradient:
-
             # Get gradient of softmin
-            diagonal_mask = torch.diag_embed(torch.ones_like(h))
-            h_grad = h.unsqueeze(2) @ h.unsqueeze(1)
-            h_grad = diagonal_mask * (h_grad - torch.diag_embed(h)) + (1 - diagonal_mask) * h_grad
-            pts_grad = h_grad @ sdf_grads * sdf_vals.unsqueeze(-1) + h.unsqueeze(-1) * sdf_grads
+            h_grad = h * (h - 1)
+            pts_grad_1 = (h_grad * sdf_vals).unsqueeze(-1) * sdf_grads
+            pts_grad_2 = h.unsqueeze(-1) * sdf_grads
+            pts_grad = (pts_grad_1 + pts_grad_2)
             pts.backward(pts_grad)
             q_grad = q.grad
 
             self.robot_query_points.detach_()
             self._query_point_mask.requires_grad_(False)
-            #q.requires_grad_(False)
             q.detach_()
             return sdf_val, q_grad.detach()
 
         return sdf_val
-
-
