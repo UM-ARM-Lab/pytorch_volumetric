@@ -17,10 +17,10 @@ class RobotScene:
         self.device = robot_sdf.device
         self.rob_assets_path = robot_assets_path
         self.threshold = 0.002
-        self.points_per_link = 50
+        self.points_per_link = 40
         self.softmin_T = 1000
         self.scene_transform = scene_transform.to(device=self.device)
-        # self.robot_query_points, self._query_point_mask = self._generate_robot_query_points()
+        #self.robot_query_points, self._query_point_mask = self._generate_robot_query_points()
         self.robot_query_points, self._query_point_mask = self._generate_scene_query_points_only_left()
 
     def _generate_robot_query_points(self):
@@ -75,7 +75,7 @@ class RobotScene:
             tfs = self.robot_sdf.sdf.obj_frame_to_link_frame.inverse()
         # print(tfs.get_matrix().shape, " tfs")
         pts = tfs.transform_points(self.robot_query_points).reshape(-1, 3)
-        print("num pts: ", pts.shape)
+        # print("num pts: ", pts.shape)
         pcd.points = o3d.utility.Vector3dVector(pts.cpu().numpy())
         self.scene_sdf.obj_factory.precompute_sdf()
         scene_mesh = self.scene_sdf.obj_factory._mesh.transform(self.scene_transform.get_matrix()[0].cpu().numpy())
@@ -95,15 +95,18 @@ class RobotScene:
         if compute_gradient:
             q.requires_grad_(True)
             q.retain_grad()
-        print(q.shape, " \n q shape")
+        # print(q.shape, " \n q shape")
         self.robot_sdf.set_joint_configuration(q)
         if only_left:
-            left_tfs_indices = torch.arange(2, 10) + 18 * torch.arange(B).unsqueeze(-1)
+            left_tfs_indices = torch.arange(2, 10)# + 18 * torch.arange(B).unsqueeze(-1)
+            # print(left_tfs_indices)
             # print(self.left_tfs_indices, self.left_tfs_indices.shape, " left tfs indices")
-            tfs_pi = self.robot_sdf.sdf.obj_frame_to_link_frame
-            tfs = tfs_pi[left_tfs_indices.view(-1)].inverse()
+            tfs_mat = self.robot_sdf.sdf.obj_frame_to_link_frame.get_matrix()
+            tfs_mat = tfs_mat.reshape(-1, B, 4, 4)
+            tfs = pk.Transform3d(matrix=tfs_mat[left_tfs_indices.view(-1)].reshape(-1, 4, 4)).inverse()
         else:
             tfs = self.robot_sdf.sdf.obj_frame_to_link_frame.inverse()
+            # print(tfs.get_matrix().shape, " tfs shape")
         # print(tfs.get_matrix().shape, " tfs shape")
         # Convention in RobotSDF is that transforms are shape (num_links, num_configs, 4, 4) before flattening
         # the first two dimensions. Thus points need to be (num_links, num_configs, num_points, 3)
