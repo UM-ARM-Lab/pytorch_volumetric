@@ -120,7 +120,7 @@ class RobotSDF(sdf.ObjectFrameSDF):
         :param link_name: name of the link
         :return: object factory for the link
         """
-        return self.sdf.sdfs[self.sdf_to_link_name.index(link_name)].obj_factory
+        return self.sdf.sdfs[self.sdf_to_link_name.index(link_name)].gt_sdf.obj_factory
 
     def __call__(self, points_in_object_frame):
         """

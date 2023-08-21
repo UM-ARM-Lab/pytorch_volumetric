@@ -10,7 +10,8 @@ import open3d as o3d
 import torch
 from arm_pytorch_utilities import tensor_utils, rand
 from multidim_indexing import torch_view
-from functools import partial
+from functools import partial, reduce
+import operator
 
 from pytorch_volumetric.voxel import VoxelGrid, get_divisible_range_by_resolution, get_coordinates_and_points_in_grid
 import pytorch_kinematics as pk
@@ -352,7 +353,8 @@ class ComposedSDF(ObjectFrameSDF):
         if self.tsf_batch is None:
             return slice(i, i + 1)
         else:
-            total_to_slice = math.prod(list(self.tsf_batch))
+            # total_to_slice = math.prod(list(self.tsf_batch))
+            total_to_slice = reduce(operator.mul, self.tsf_batch)
             return slice(i * total_to_slice, (i + 1) * total_to_slice)
 
     def __call__(self, points_in_object_frame):
@@ -543,7 +545,7 @@ def sample_mesh_points(obj_factory: ObjectFactory = None, num_points=100, seed=0
         if not clean_cache and num_points in cache[name][seed]:
             res = cache[name][seed][num_points]
             res = list(v.to(device=device, dtype=dtype) if v is not None else None for v in res)
-            return *res[:-1], cache
+            return (*res[:-1], cache)
     else:
         cache = {name: {seed: {}}}
 
