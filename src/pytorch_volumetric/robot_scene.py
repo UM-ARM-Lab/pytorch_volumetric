@@ -130,7 +130,7 @@ class RobotScene:
         sdf_vals = sdf_vals.reshape(B, -1)
         sdf_grads = sdf_grads.reshape(B, -1, 3)
         # use softmin to get gradient but use hard min for actual sdf value
-        h = torch.softmax(-self.softmin_T * sdf_vals, dim=1)
+        h = torch.softmax(-self.softmin_temp * sdf_vals, dim=1)
 
         sdf_val = torch.min(sdf_vals, dim=1).values
 
