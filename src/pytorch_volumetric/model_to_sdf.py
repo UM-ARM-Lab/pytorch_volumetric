@@ -106,7 +106,7 @@ class RobotSDF(sdf.ObjectFrameSDF):
             # must be of shape (num_links, *self.configuration_batch, 4, 4) before flattening
             expand_dims = (None,) * len(self.configuration_batch)
             offset_tsf_mat = offset_tsf.get_matrix()[(slice(None),) + expand_dims]
-            offset_tsf_mat = offset_tsf_mat.repeat(1, *self.configuration_batch, 1, 1)
+            offset_tsf_mat = offset_tsf_mat.expand(-1, *self.configuration_batch, -1, -1)
             offset_tsf = pk.Transform3d(matrix=offset_tsf_mat.reshape(-1, 4, 4))
 
         tsfs = torch.cat(tsfs)
@@ -131,6 +131,12 @@ class RobotSDF(sdf.ObjectFrameSDF):
         number of batch dimensions.
         """
         return self.sdf(points_in_object_frame)
+
+    def get_hessian(self, points_in_object_frame):
+        return self.sdf.get_hessian(points_in_object_frame)
+
+    def precompute_sdf(self):
+        self.sdf.precompute_sdf()
 
 
 def cache_link_sdf_factory(resolution=0.01, padding=0.1, **kwargs):
