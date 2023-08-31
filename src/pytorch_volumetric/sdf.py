@@ -125,14 +125,14 @@ class ObjectFactory(abc.ABC):
         distance = np.linalg.norm(gradient, axis=-1)
         # normalize gradients
         has_direction = distance > 0
-        gradient[has_direction] /= distance[has_direction, None]
+        gradient[has_direction] = gradient[has_direction] / distance[has_direction, None]
 
         rays = np.concatenate([points_in_object_frame, np.ones_like(points_in_object_frame)], axis=-1)
         intersection_counts = self._raycasting_scene.count_intersections(rays).numpy()
         is_inside = intersection_counts % 2 == 1
-        distance[is_inside] *= -1
+        distance[is_inside] = distance[is_inside] * -1
         # fix gradient direction to point away from surface outside
-        gradient[~is_inside] *= -1
+        gradient[~is_inside] = gradient[~is_inside] * -1
 
         # for any points very close to the surface, it is better to use the surface normal as the gradient
         # this is because the closest point on the surface may be noisy when close by
