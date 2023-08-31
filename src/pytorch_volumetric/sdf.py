@@ -127,7 +127,13 @@ class ObjectFactory(abc.ABC):
         has_direction = distance > 0
         gradient[has_direction] = gradient[has_direction] / distance[has_direction, None]
 
-        rays = np.concatenate([points_in_object_frame, np.ones_like(points_in_object_frame)], axis=-1)
+        # ensure ray destination is outside the object
+        ray_destination = np.repeat(self.bounding_box(padding=1.0)[None, :, 1], points_in_object_frame.shape[0], axis=0)
+        # add noise to ray destination, this helps reduce artifacts in the sdf
+        ray_destination = ray_destination + 1e-4 * np.random.randn(*points_in_object_frame.shape)
+        ray_destination = ray_destination.astype(np.float32)
+        # check if point is inside the object
+        rays = np.concatenate([points_in_object_frame, ray_destination], axis=-1)
         intersection_counts = self._raycasting_scene.count_intersections(rays).numpy()
         is_inside = intersection_counts % 2 == 1
         distance[is_inside] = distance[is_inside] * -1
