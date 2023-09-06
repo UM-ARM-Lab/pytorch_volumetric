@@ -61,7 +61,7 @@ class RobotScene:
         return query_points, mask
 
 
-    def visualize_robot(self, q: torch.Tensor, only_left=False):
+    def visualize_robot(self, q: torch.Tensor, only_left=False, cached=False):
         # print(self.robot_query_points, self.robot_query_points.shape, " query pts")
         import open3d as o3d
         pcd = o3d.geometry.PointCloud()
@@ -77,8 +77,12 @@ class RobotScene:
         pts = tfs.transform_points(self.robot_query_points).reshape(-1, 3)
         # print("num pts: ", pts.shape)
         pcd.points = o3d.utility.Vector3dVector(pts.cpu().numpy())
-        self.scene_sdf.obj_factory.precompute_sdf()
-        scene_mesh = self.scene_sdf.obj_factory._mesh.transform(self.scene_transform.get_matrix()[0].cpu().numpy())
+        if cached:
+            self.robot_sdf.gt_sdf.obj_factory.precompute_sdf()
+            scene_mesh = self.scene_sdf.gt_sdf.obj_factory._mesh.transform(self.scene_transform.get_matrix()[0].cpu().numpy())
+        else:
+            self.scene_sdf.obj_factory.precompute_sdf()
+            scene_mesh = self.scene_sdf.obj_factory._mesh.transform(self.scene_transform.get_matrix()[0].cpu().numpy())
         o3d.visualization.draw_geometries(pv.get_transformed_meshes(self.robot_sdf) + [pcd, scene_mesh])
 
     def scene_collision_check(self, q: torch.Tensor, only_left=False, compute_gradient=False, compute_hessian=False):
