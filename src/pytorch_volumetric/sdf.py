@@ -82,6 +82,7 @@ class ObjectFactory(abc.ABC):
     def precompute_sdf(self):
         # scale mesh the approrpiate amount
         full_path = self.get_mesh_high_poly_resource_filename()
+        full_path = os.path.expanduser(full_path)
         if not os.path.exists(full_path):
             raise RuntimeError(f"Expected mesh file does not exist: {full_path}")
         self._mesh = o3d.io.read_triangle_mesh(full_path)

@@ -19,7 +19,7 @@ def get_divisible_range_by_resolution(resolution, range_per_dim):
 
 def get_coordinates_and_points_in_grid(resolution, range_per_dim, dtype=torch.float, device='cpu', get_points=True):
     # create points along the value ranges
-    coords = [torch.arange(low, high + 0.9 *resolution, resolution, dtype=dtype, device=device) for low, high in
+    coords = [torch.arange(low, high + 0.9 * resolution, resolution, dtype=dtype, device=device) for low, high in
               range_per_dim]
     pts = torch.cartesian_prod(*coords) if get_points else None
     return coords, pts
@@ -49,8 +49,7 @@ class VoxelGrid(Voxels):
 
     def _create_voxels(self, resolution, range_per_dim):
         self.range_per_dim = get_divisible_range_by_resolution(resolution, range_per_dim)
-        self.coords, self.pts = get_coordinates_and_points_in_grid(resolution, self.range_per_dim, dtype=self.dtype,
-                                                                   device=self.device)
+        self.coords, self.pts = get_coordinates_and_points_in_grid(resolution, self.range_per_dim, device=self.device)
         # underlying data
         self._data = torch.zeros([len(coord) for coord in self.coords], dtype=self.dtype, device=self.device)
         self.voxels = torch_view.TorchMultidimView(self._data, self.range_per_dim, invalid_value=self.invalid_val)
