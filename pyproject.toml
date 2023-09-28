@@ -1,6 +1,6 @@
 [project]
 name = "pytorch_volumetric"
-version = "0.3.7"
+version = "0.4.0"
 description = "Volumetric structures such as voxels and SDFs implemented in pytorch"
 readme = "README.md" # Optional
 
