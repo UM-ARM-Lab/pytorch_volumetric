@@ -115,3 +115,25 @@ class VoxelSet(Voxels):
 
     def get_known_pos_and_values(self):
         return self.positions, self.values
+
+
+def voxel_down_sample(points, resolution, range_per_dim=None):
+    """
+    Down sample point clouds to the center of a voxel grid with a given resolution.
+    Much faster than open3d's voxel_down_sample but at the cost of more memory usage since they
+    loop over points while we process all points in parallel.
+    :param points: N x D point cloud
+    :param resolution: Voxel size
+    :param range_per_dim: Range of the voxel grid, if None, will be determined by the points (you may want to specify
+    smaller range than the range the points to ignore outliers)
+    :return:
+    """
+    if range_per_dim is None:
+        range_per_dim = np.stack(
+            (points.min(dim=0)[0].cpu().numpy(), points.max(dim=0)[0].cpu().numpy())).T
+
+    device = points.device
+    voxel = VoxelGrid(resolution, range_per_dim, device=device)
+    voxel[points] = 1
+    pts, _ = voxel.get_known_pos_and_values()
+    return pts
