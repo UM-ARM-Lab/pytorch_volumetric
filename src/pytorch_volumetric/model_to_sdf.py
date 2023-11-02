@@ -133,19 +133,39 @@ def cache_link_sdf_factory(resolution=0.01, padding=0.1, **kwargs):
     return create_sdf
 
 
-def aabb_to_ordered_end_points(aabb):
+def aabb_to_ordered_end_points(aabb, arrange_in_sequential_order=False):
     aabbMin = aabb[:, 0]
     aabbMax = aabb[:, 1]
-    arr = [
-        [aabbMin[0], aabbMin[1], aabbMin[2]],
-        [aabbMax[0], aabbMin[1], aabbMin[2]],
-        [aabbMin[0], aabbMax[1], aabbMin[2]],
-        [aabbMin[0], aabbMin[1], aabbMax[2]],
-        [aabbMin[0], aabbMax[1], aabbMax[2]],
-        [aabbMax[0], aabbMin[1], aabbMax[2]],
-        [aabbMax[0], aabbMax[1], aabbMin[2]],
-        [aabbMax[0], aabbMax[1], aabbMax[2]]
-    ]
+    if arrange_in_sequential_order:
+        arr = [
+            [aabbMin[0], aabbMin[1], aabbMin[2]],
+            [aabbMax[0], aabbMin[1], aabbMin[2]],
+            [aabbMax[0], aabbMax[1], aabbMin[2]],
+            [aabbMin[0], aabbMax[1], aabbMin[2]],
+            [aabbMin[0], aabbMin[1], aabbMin[2]],
+            [aabbMin[0], aabbMin[1], aabbMax[2]],
+            [aabbMax[0], aabbMin[1], aabbMax[2]],
+            [aabbMax[0], aabbMin[1], aabbMin[2]],
+            [aabbMax[0], aabbMin[1], aabbMax[2]],
+            [aabbMax[0], aabbMax[1], aabbMax[2]],
+            [aabbMax[0], aabbMax[1], aabbMin[2]],
+            [aabbMax[0], aabbMax[1], aabbMax[2]],
+            [aabbMin[0], aabbMax[1], aabbMax[2]],
+            [aabbMin[0], aabbMax[1], aabbMin[2]],
+            [aabbMin[0], aabbMax[1], aabbMax[2]],
+            [aabbMin[0], aabbMin[1], aabbMax[2]],
+        ]
+    else:
+        arr = [
+            [aabbMin[0], aabbMin[1], aabbMin[2]],
+            [aabbMax[0], aabbMin[1], aabbMin[2]],
+            [aabbMin[0], aabbMax[1], aabbMin[2]],
+            [aabbMin[0], aabbMin[1], aabbMax[2]],
+            [aabbMin[0], aabbMax[1], aabbMax[2]],
+            [aabbMax[0], aabbMin[1], aabbMax[2]],
+            [aabbMax[0], aabbMax[1], aabbMin[2]],
+            [aabbMax[0], aabbMax[1], aabbMax[2]]
+        ]
     if torch.is_tensor(aabb):
         return torch.tensor(arr, device=aabb.device, dtype=aabb.dtype)
     return np.array(arr)
