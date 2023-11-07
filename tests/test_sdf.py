@@ -7,7 +7,7 @@ from pytorch_volumetric import sample_mesh_points
 TEST_DIR = os.path.dirname(__file__)
 
 
-def do_test_gradients_at_surface_pts(mesh):
+def test_gradients_at_surface_pts(mesh):
     d = "cuda" if torch.cuda.is_available() else "cpu"
 
     # press n to visualize the normals / gradients
@@ -57,6 +57,7 @@ def do_test_gradients_at_surface_pts(mesh):
     pcd.colors = o3d.utility.Vector3dVector(colors.cpu())
     o3d.visualization.draw_geometries([sdf.obj_factory._mesh, pcd])
 
+
 def test_compose_sdf():
     import pytorch_kinematics as pk
     d = "cuda" if torch.cuda.is_available() else "cpu"
@@ -88,10 +89,27 @@ def test_compose_sdf():
     o3d.visualization.draw_geometries([sdf.obj_factory._mesh, pcd])
 
 
+def do_test_cube_gradients():
+    obj = pv.MeshObjectFactory("cube.obj")
+    sdf = pv.MeshSDF(obj)
+    query_points = torch.tensor([
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [-1.0, 0.0, 0.0],
+        [0.0, -1.0, 0.0],
+        [0.0, 0.0, -1.0],
+    ])
+    sdf_vals, sdf_grads = sdf(query_points)
+    assert torch.allclose(sdf_grads, query_points)
+
+
 def test_gradients_at_surface_pts():
     do_test_gradients_at_surface_pts("probe.obj")
     do_test_gradients_at_surface_pts("offset_wrench_nogrip.obj")
 
 
 if __name__ == "__main__":
+    test_cube_gradients()
     test_gradients_at_surface_pts()
+    test_compose_sdf()
