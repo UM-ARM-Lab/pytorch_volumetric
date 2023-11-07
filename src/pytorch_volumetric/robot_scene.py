@@ -33,7 +33,7 @@ class RobotScene:
         self.points_per_link = points_per_link
         self.softmin_temp = softmin_temp
         self.desired_link_idx = []
-        self.link_to_actuated_joint_idx = []
+        self.desired_frame_idx = []
         if collision_check_links is not None:
             self.desired_links = collision_check_links
         else:
@@ -67,9 +67,12 @@ class RobotScene:
                 points, _, _ = sdf.sample_mesh_points(link_sdf, self.points_per_link,
                                                       dbpath=f'{link_name}_points_cache.pkl', device=self.device)
                 query_points.append(points)
+                # TODO: confusing because index from robot_sdf and from chain are not the same, perhaps unify them?
                 self.desired_link_idx.append(i)
-
+                self.desired_frame_idx.append(self.robot_sdf.chain.frame_to_idx[link_name])
         self.desired_link_idx = torch.tensor(self.desired_link_idx, device=self.device, dtype=torch.long)
+        self.desired_frame_idx = torch.tensor(self.desired_frame_idx, device=self.device, dtype=torch.long)
+
         query_points = torch.stack(query_points, dim=0)
         # mask out points that are in self-collision with default configuration
         tfs = self._get_desired_tfs().inverse()
@@ -138,10 +141,6 @@ class RobotScene:
         if compute_hessian and not compute_gradient:
             raise ValueError('Cannot compute hessian without gradient')
 
-        #if compute_gradient:
-        #    q.requires_grad_(True)
-        #    q.retain_grad()
-
         pts_world = self.transform_to_world(q)
         pts = self.transform_world_to_scene(pts_world)
 
@@ -155,23 +154,13 @@ class RobotScene:
         # get minimum links
         sdf_vals = sdf_vals.reshape(B, -1)
         sdf_grads = sdf_grads.reshape(B, -1, 3)
-
         sdf_indices = torch.argsort(sdf_vals, dim=1, descending=False)
-
-        # get closest point as the constraint
         sdf_val = sdf_vals[torch.arange(B), sdf_indices[:, 0]]
-
-        # sdf_val, sdf_idx = torch.min(sdf_vals, dim=1)
 
         rvals = {
             'sdf': sdf_val,
         }
         if compute_gradient:
-            # pts_jacobian = torch.sum(h[:, :, None, None] * self.grad_points(q, h), dim=1)  # B x 3 x 14
-            # q is B x 14
-            # take points, transform back to world frame, then compute jacobian at these locations
-            # get the link indices for each point
-
             # rather than take a single point we use the softmin to get a weighted average of the gradients for
             # the self.grad_smooth_points number of closest points, this helps smooth the gradient
             B_range = torch.arange(B).unsqueeze(-1)
@@ -179,14 +168,12 @@ class RobotScene:
             closest_sdf_grads = sdf_grads[B_range, closest_indices]
             closest_sdf_vals = sdf_vals[B_range, closest_indices]
             h = torch.softmax(-self.softmin_temp * closest_sdf_vals, dim=1)
-
             new_grad = True
             pts_hessian = None
             if new_grad:
                 closest_pts = pts.reshape(B, -1, 3)[B_range, closest_indices].reshape(-1, 3)
-                closest_links = self.desired_link_idx[closest_indices // self.points_per_link].reshape(-1)
-                q_repeat = q.unsqueeze(1).repeat(1, self.grad_smooth_points, 1).reshape(B*self.grad_smooth_points, -1)
-
+                closest_links = self.desired_frame_idx[closest_indices // self.points_per_link].reshape(-1)
+                q_repeat = q.unsqueeze(1).repeat(1, self.grad_smooth_points, 1).reshape(B * self.grad_smooth_points, -1)
                 if not compute_hessian:
                     pts_jacobian = self.robot_sdf.chain.jacobian(q_repeat,
                                                                  locations=closest_pts,
@@ -215,10 +202,6 @@ class RobotScene:
                 q_hess2 = pts_jacobian.transpose(2, 3) @ sdf_weighted_hess @ pts_jacobian
                 q_hess = q_hess + q_hess2
                 rvals['hess_sdf'] = torch.sum(q_hess, dim=1)
-
-            #self.robot_query_points.detach_()
-            #self._query_point_mask.requires_grad_(False)
-            #q = q.dstach()
 
         return rvals
 
