@@ -401,7 +401,7 @@ class ComposedSDF(ObjectFrameSDF):
             S_tsf = len(self.obj_frame_to_link_frame)
             if self.tsf_batch is None and (S_tsf != S):
                 self.tsf_batch = (S_tsf / S,)
-            m = tsf.get_matrix().inverse()
+            m = tsf.inverse().get_matrix()
             for i in range(S):
                 self.link_frame_to_obj_frame.append(
                     pk.Transform3d(matrix=m[self.ith_transform_slice(i)]))
