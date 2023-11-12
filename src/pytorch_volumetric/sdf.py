@@ -83,7 +83,7 @@ class ObjectFactory(abc.ABC):
         return ranges
 
     def precompute_sdf(self):
-        # scale mesh the approrpiate amount
+        # scale mesh the appropriate amount
         full_path = self.get_mesh_high_poly_resource_filename()
         if not os.path.exists(full_path):
             raise RuntimeError(f"Expected mesh file does not exist: {full_path}")
@@ -228,12 +228,15 @@ class MeshObjectFactory(ObjectFactory):
 
 class ObjectFrameSDF(abc.ABC):
     @abc.abstractmethod
-    def __call__(self, points_in_object_frame):
+    def __call__(self, points_in_object_frame, return_extra_info=False):
         """
         Evaluate the signed distance function at given points in the object frame
         :param points_in_object_frame: B x N x d d-dimensional points (2 or 3) of B batches; located in object frame
-        :return: tuple of B x N signed distance from closest object surface in m and B x N x d SDF gradient pointing
+        :param return_extra_info: bool: If true, returns a dictionary with return values and additional info
+        :return: If return_extra_info is False,
+            tuple of B x N signed distance from closest object surface in m and B x N x d SDF gradient pointing
             towards higher SDF values (away from surface when outside the object and towards the surface when inside)
+            If return_extra_info is True, then returns a dictionary
         """
 
     @abc.abstractmethod
@@ -298,18 +301,16 @@ class ObjectFrameSDF(abc.ABC):
             Loads the mesh and precomputes the SDF
         """
 
-    @abc.abstractmethod
-    def get_hessian(self, points_in_object_frame):
-        """
-      Evaluate the signed distance function at given points in the object frame, also returning the SDF gessuab
-      :param points_in_object_frame: B x N x d d-dimensional points (2 or 3) of B batches; located in object frame
-      :return: tuple of B x N signed distance from closest object surface in m and B x N x d SDF gradient pointing
-          towards higher SDF values (away from surface when outside the object and towards the surface when inside),
-          and B x N x d x d Hessian matrix of the SDF
-      """
-
     def get_mesh_list(self):
         return []
+
+    @abc.abstractmethod
+    def sample_surface_points(self, num_points, **kwargs):
+        """
+        Sample points on the surface of the object
+        :param num_points: number of points to sample
+        :return: B x num_points x d tensor of points on the surface of the object
+        """
 
 
 class MeshSDF(ObjectFrameSDF):
@@ -322,11 +323,11 @@ class MeshSDF(ObjectFrameSDF):
     def surface_bounding_box(self, padding=0.):
         return torch.tensor(self.obj_factory.bounding_box(padding))
 
-    def __call__(self, points_in_object_frame):
+    def __call__(self, points_in_object_frame, return_extra_info=False):
         N, d = points_in_object_frame.shape[-2:]
 
         # compute SDF value for new sampled points
-        res = self.obj_factory.object_frame_closest_point(points_in_object_frame)
+        res = self.obj_factory.object_frame_closest_point(points_in_object_frame, compute_hessian=return_extra_info)
 
         # points are transformed to link frame, thus it needs to compare against the object in link frame
         # objId is not in link frame and shouldn't be moved
@@ -339,18 +340,145 @@ class MeshSDF(ObjectFrameSDF):
                 self.vis.draw_point("test_point_surf", res.closest[..., i, :].detach().cpu(), color=(0, 1, 0),
                                     length=0.005,
                                     label=f'{res.distance[..., i].item():.5f}')
+        if return_extra_info:
+            return {
+                'sdf_val': res.distance,
+                'sdf_grad': res.gradient,
+                'sdf_hess': res.hessian.reshape(*res.distance.shape, 3, 3),
+            }
         return res.distance, res.gradient
-
-    def get_hessian(self, points_in_object_frame):
-        # compute SDF value for new sampled points
-        res = self.obj_factory.object_frame_closest_point(points_in_object_frame, compute_hessian=True)
-        return res.distance, res.gradient, res.hessian.reshape(*res.distance.shape, 3, 3)
 
     def precompute_sdf(self):
         self.obj_factory.precompute_sdf()
 
     def get_mesh_list(self):
         return [copy.deepcopy(self.obj_factory.get_mesh())]
+
+    def sample_surface_points(self, num_points, device='cpu', **kwargs):
+        points, normals, _ = sample_mesh_points(self.obj_factory, num_points=num_points, device=device, **kwargs)
+        return points, normals
+
+
+class BoxSDF(ObjectFrameSDF):
+
+    def __init__(self, extents, vis=None, device='cpu'):
+        self.extents = torch.tensor([extents[0], extents[1], extents[2]], device=device) / 2.0
+        self.vis = vis
+
+    def surface_bounding_box(self, padding=0.):
+        return torch.tensor([[-self.extents[0] - padding, -self.extents[1] - padding, -self.extents[2] - padding],
+                             [self.extents[0] + padding, self.extents[1] + padding, self.extents[2] + padding]])
+
+    def __call__(self, points_in_object_frame, return_extra_info=False):
+        N, d = points_in_object_frame.shape[-2:]
+
+        # first compute which octant we are in
+        octant = torch.sign(points_in_object_frame)
+
+        # radius for smoothing corners - for better gradients
+        radius = 0.01
+
+        diff = torch.abs(points_in_object_frame) - (self.extents.unsqueeze(0) - radius)
+        q = torch.clamp(diff, min=0)
+        l = torch.linalg.norm(q, dim=-1)
+        max_component, max_component_idx = torch.max(diff, dim=-1)
+        sdf_value = torch.where(max_component > 0.0,
+                                l - radius, max_component - radius)
+
+        # compute sdf grad as if we are inside the obstacle
+        sdf_grad = torch.zeros(N, d, device=points_in_object_frame.device)
+        sdf_grad[torch.arange(N), max_component_idx] = 1.0
+        sdf_grad = torch.where(max_component.unsqueeze(-1) > 0.0, q / l.unsqueeze(-1),
+                               sdf_grad)
+
+        # get sdf_grads back in overall frame
+        sdf_grad = sdf_grad * octant
+
+        # Hessian for block is zero everywhere except for diagonals where it is undefined, so we set it to 0
+        # TODO: Including radius of corners results in a non-zero hessian around corners, perhaps compute that?
+        sdf_hess = torch.zeros(*points_in_object_frame.shape[:-1], d, d, device=points_in_object_frame.device)
+
+        # points are transformed to link frame, thus it needs to compare against the object in link frame
+        # objId is not in link frame and shouldn't be moved
+        if self.vis is not None:
+            for i in range(N):
+                self.vis.draw_point("test_point", points_in_object_frame[..., i, :], color=(1, 0, 0), length=0.005)
+                self.vis.draw_point("test_point_surf", sdf_value[..., i, :].detach().cpu(), color=(0, 1, 0),
+                                    length=0.005,
+                                    label=f'{sdf_value[..., i].item():.5f}')
+
+        if return_extra_info:
+            return {
+                'sdf_val': sdf_value,
+                'sdf_grad': sdf_grad,
+                'sdf_hess': sdf_hess
+            }
+        return sdf_value, sdf_grad
+
+    def precompute_sdf(self):
+        pass
+
+    def get_mesh_list(self):
+        extents = self.extents.cpu().numpy()
+        return [o3d.geometry.TriangleMesh.create_box(*(2 * extents)).translate(-extents)]
+
+    def sample_surface_points(self, num_points, device='cpu', **kwargs):
+        # because our object is so straightforward we should be able to use a single gradient step on the sdf
+        # get points in unit box
+        # randomly generate points in unit box
+        points = torch.rand(num_points, 3, device=device) * 2 - 1
+
+        sdf_val, sdf_grad = self(points)
+
+        new_points = points - sdf_val.unsqueeze(-1) * sdf_grad
+        new_sdf_val, new_sdf_grad = self(new_points)
+
+        return new_points, new_sdf_grad
+
+
+class SphereSDF(ObjectFrameSDF):
+
+    def __init__(self, radius, vis=None):
+        self.radius = radius
+        self.vis = vis
+
+    def surface_bounding_box(self, padding=0.):
+        return torch.tensor([[-self.radius - padding, self.radius + padding],
+                             [-self.radius - padding, self.radius + padding],
+                             [-self.radius - padding, self.radius + padding]])
+
+    def __call__(self, points_in_object_frame: torch.Tensor, return_extra_info=False):
+        norm = torch.linalg.norm(points_in_object_frame, dim=-1, keepdim=True)
+        sdf_val = norm.squeeze(-1) - self.radius
+        sdf_grad = points_in_object_frame / norm
+
+        N, d = points_in_object_frame.shape[-2:]
+        eye = torch.eye(d, device=points_in_object_frame.device).expand(*points_in_object_frame.shape[:-1], d, d)
+
+        outer = points_in_object_frame.unsqueeze(-1) @ points_in_object_frame.unsqueeze(-2)
+        sdf_hess = (eye * norm.unsqueeze(-1) ** 2 - outer) / norm.unsqueeze(-1) ** 3
+
+        if return_extra_info:
+            return {
+                'sdf_val': sdf_val,
+                'sdf_grad': sdf_grad,
+                'sdf_hess': sdf_hess
+            }
+        return sdf_val, sdf_grad
+
+    def precompute_sdf(self):
+        pass
+
+    def get_mesh_list(self):
+        return [o3d.geometry.TriangleMesh.create_sphere(radius=self.radius)]
+
+    def sample_surface_points(self, num_points, device='cpu', **kwargs):
+        # randomly generate points in unit box
+        points = torch.rand(num_points, 3, device=device) * 2 - 1
+        # project points onto sphere
+        points = points / torch.linalg.norm(points, dim=-1, keepdim=True) * self.radius
+        # normals are just the unit norm vectors in same direction as vector to points
+        return points, points / self.radius
 
 
 class ComposedSDF(ObjectFrameSDF):
@@ -413,66 +541,33 @@ class ComposedSDF(ObjectFrameSDF):
             total_to_slice = math.prod(list(self.tsf_batch))
             return slice(i * total_to_slice, (i + 1) * total_to_slice)
 
-    def __call__(self, points_in_object_frame):
+    def __call__(self, points_in_object_frame, return_extra_info=False):
         pts_shape = points_in_object_frame.shape
-        # flatten it for the transform
-        points_in_object_frame = points_in_object_frame.view(-1, 3)
-        flat_shape = points_in_object_frame.shape
         S = len(self.sdfs)
-        # pts[i] are now points in the ith SDF's frame
-        pts = self.obj_frame_to_link_frame.transform_points(points_in_object_frame)
         # S x B x N x 3
         if self.tsf_batch is not None:
-            pts = pts.reshape(S, *self.tsf_batch, *flat_shape)
-        sdfv = []
-        sdfg = []
-        for i, sdf in enumerate(self.sdfs):
-            # B x N for v and B x N x 3 for g
-            v, g = sdf(pts[i])
-            # need to transform the gradient back to the object frame
-            g = self.link_frame_to_obj_frame[i].transform_normals(g)
-            sdfv.append(v)
-            sdfg.append(g)
+            # if tsf batch is not None then we assume we have B points for B tsfs
+            pts = points_in_object_frame.reshape(*self.tsf_batch, -1, 3).expand(S, *self.tsf_batch, -1, 3)
+            N = pts.shape[-2]
+            pts = self.obj_frame_to_link_frame.transform_points(pts.reshape(-1, N, 3))
+            pts = pts.reshape(S, *self.tsf_batch, N, 3)
+        else:
+            # flatten it for the transform
+            points_in_object_frame = points_in_object_frame.view(-1, 3)
+            flat_shape = points_in_object_frame.shape
+            # pts[i] are now points in the ith SDF's frame
+            pts = self.obj_frame_to_link_frame.transform_points(points_in_object_frame)
 
-        # attempt at doing things in higher dimensions
-        sdfv = torch.cat(sdfv)
-        sdfg = torch.cat(sdfg)
-
-        # easier solution for flattening
-        v = sdfv.reshape(S, -1)
-        g = sdfg.reshape(S, -1, 3)
-        # ensure S is the first dimension and take min across S (the different links)
-        closest = torch.argmin(v, 0)
-
-        all = torch.arange(0, v.shape[1])
-        # B*N for vv and B*N x 3 for gg
-        vv = v[closest, all]
-        gg = g[closest, all]
-
-        if self.tsf_batch is not None:
-            # retrieve the original query points batch dimensions - note that they are after configuration batch
-            vv = vv.reshape(*self.tsf_batch, *pts_shape[:-1])
-            gg = gg.reshape(*self.tsf_batch, *pts_shape[:-1], 3)
-
-        return vv, gg
-
-    def get_hessian(self, points_in_object_frame):
-        pts_shape = points_in_object_frame.shape
-        # flatten it for the transform
-        points_in_object_frame = points_in_object_frame.view(-1, 3)
-        flat_shape = points_in_object_frame.shape
-        S = len(self.sdfs)
-        # pts[i] are now points in the ith SDF's frame
-        pts = self.obj_frame_to_link_frame.transform_points(points_in_object_frame)
-        # S x B x N x 3
-        if self.tsf_batch is not None:
-            pts = pts.reshape(S, *self.tsf_batch, *flat_shape)
         sdfv = []
         sdfg = []
         sdfh = []
         for i, sdf in enumerate(self.sdfs):
             # B x N for v and B x N x 3 for g
-            v, g, h = sdf.get_hessian(pts[i])
+            sdf_result = sdf(pts[i], return_extra_info=True)
+            v = sdf_result['sdf_val']
+            g = sdf_result['sdf_grad']
+            h = sdf_result['sdf_hess']
+
             # need to transform the gradient back to the object frame
             g = self.link_frame_to_obj_frame[i].transform_normals(g)
 
@@ -501,12 +596,19 @@ class ComposedSDF(ObjectFrameSDF):
         gg = g[closest, all]
         hh = h[closest, all]
         if self.tsf_batch is not None:
-            # retrieve the original query points batch dimensions - note that they are after configuration batch
-            vv = vv.reshape(*self.tsf_batch, *pts_shape[:-1])
-            gg = gg.reshape(*self.tsf_batch, *pts_shape[:-1], 3)
-            hh = hh.reshape(*self.tsf_batch, *pts_shape[:-1], 3, 3)
-
-        return vv, gg, hh
+            vv = vv.reshape(*pts_shape[:-1])
+            gg = gg.reshape(*pts_shape[:-1], 3)
+            hh = hh.reshape(*pts_shape[:-1], 3, 3)
+            closest = closest.reshape(*pts_shape[:-1])
+        if not return_extra_info:
+            return vv, gg
+        else:
+            return {
+                'sdf_val': vv,
+                'sdf_grad': gg,
+                'sdf_hess': hh,
+                'closest_sdf': closest
+            }
 
     def precompute_sdf(self):
         for sdf in self.sdfs:
@@ -514,6 +616,13 @@ class ComposedSDF(ObjectFrameSDF):
 
     def get_mesh_list(self):
         return get_composed_meshes(self)
+
+    def sample_surface_points(self, num_points, **kwargs):
+        num_sdfs = len(self.sdfs)
+        # want to sample from each SDF proportionally to its volume - could use bounding box
+        # but that is not a great approximation for the volume of the object
+        # TODO: not needed right now, user can manually do it by sampling from each SDF
+        raise NotImplementedError()
 
 
 class CachedSDF(ObjectFrameSDF):
@@ -573,7 +682,10 @@ class CachedSDF(ObjectFrameSDF):
             if not cache_sdf_hessian:
                 sdf_val, sdf_grad = gt_sdf(pts)
             else:
-                sdf_val, sdf_grad, sdf_hess = gt_sdf.get_hessian(pts)
+                sdf_result = gt_sdf(pts, return_extra_info=True)
+                sdf_val = sdf_result['sdf_val']
+                sdf_grad = sdf_result['sdf_grad']
+                sdf_hess = sdf_result['sdf_hess']
                 cached_underlying_sdf_hessian = sdf_hess.squeeze(0)
 
             cached_underlying_sdf = sdf_val.reshape([len(coord) for coord in coords])
@@ -610,32 +722,7 @@ class CachedSDF(ObjectFrameSDF):
         sdf_val = sdf_val.to(device=self.device)
         return sdf_val
 
-    def __call__(self, points_in_object_frame):
-        # check when points are out of cached range and use ground truth sdf for both value and grad
-        keys = self.voxels.ensure_index_key(points_in_object_frame)
-        keys_ravelled = self.voxels.ravel_multi_index(keys, self.voxels.shape)
-
-        inbound_keys = self.voxels.get_valid_values(points_in_object_frame)
-        out_of_bound_keys = ~inbound_keys
-
-        dtype = points_in_object_frame.dtype
-        val = torch.zeros(keys_ravelled.shape, device=self.device, dtype=dtype)
-        grad = torch.zeros(keys.shape, device=self.device, dtype=dtype)
-
-        val[inbound_keys] = self.voxels.raw_data[keys_ravelled[inbound_keys]]
-        grad[inbound_keys] = self.voxels_grad[keys_ravelled[inbound_keys]]
-        val[out_of_bound_keys], grad[out_of_bound_keys] = self.gt_sdf(points_in_object_frame[out_of_bound_keys])
-
-        if self.debug_check_sdf:
-            val_gt = self._fallback_sdf_value_func(points_in_object_frame)
-            # the ones that are valid should be close enough to the ground truth
-            diff = torch.abs(val - val_gt)
-            close_enough = diff < self.resolution
-            within_bounds = self.voxels.get_valid_values(points_in_object_frame)
-            assert torch.all(close_enough[within_bounds])
-        return val, grad
-
-    def get_hessian(self, points_in_object_frame):
+    def __call__(self, points_in_object_frame, return_extra_info=False):
         # check when points are out of cached range and use ground truth sdf for both value and grad
         keys = self.voxels.ensure_index_key(points_in_object_frame)
         keys_ravelled = self.voxels.ravel_multi_index(keys, self.voxels.shape)
@@ -651,9 +738,11 @@ class CachedSDF(ObjectFrameSDF):
         val[inbound_keys] = self.voxels.raw_data[keys_ravelled[inbound_keys]]
         grad[inbound_keys] = self.voxels_grad[keys_ravelled[inbound_keys]]
         hess[inbound_keys] = self.voxels_hessian[keys_ravelled[inbound_keys]]
+        gt_result = self.gt_sdf(points_in_object_frame[out_of_bound_keys], return_extra_info=True)
+        val[out_of_bound_keys] = gt_result['sdf_val']
+        grad[out_of_bound_keys] = gt_result['sdf_grad']
+        hess[out_of_bound_keys] = gt_result['sdf_hess']
 
-        val[out_of_bound_keys], grad[out_of_bound_keys], hess[out_of_bound_keys] = \
-            self.gt_sdf.get_hessian(points_in_object_frame[out_of_bound_keys])
         if self.debug_check_sdf:
             val_gt = self._fallback_sdf_value_func(points_in_object_frame)
             # the ones that are valid should be close enough to the ground truth
@@ -661,7 +750,10 @@ class CachedSDF(ObjectFrameSDF):
             close_enough = diff < self.resolution
             within_bounds = self.voxels.get_valid_values(points_in_object_frame)
             assert torch.all(close_enough[within_bounds])
-        return val, grad, hess
+
+        if return_extra_info:
+            return {'sdf_val': val, 'sdf_grad': grad, 'sdf_hess': hess}
+        return val, grad
 
     def outside_surface(self, points_in_object_frame, surface_level=0):
         keys = self.voxels.ensure_index_key(points_in_object_frame)
@@ -691,6 +783,9 @@ class CachedSDF(ObjectFrameSDF):
 
     def precompute_sdf(self):
         self.gt_sdf.precompute_sdf()
+
+    def sample_surface_points(self, num_points, **kwargs):
+        return self.gt_sdf.sample_surface_points(num_points, **kwargs)
 
 
 def sample_mesh_points(obj_factory: ObjectFactory = None, num_points=100, seed=0, name="",
@@ -759,7 +854,7 @@ def get_composed_meshes(composed_sdf: ComposedSDF, obj_to_world_tsf=None):
     tsfs = tsfs.get_matrix()
     for i in range(len(composed_sdf.sdfs)):
         # assuming they are individually MeshSDFs
-        mesh = copy.deepcopy(composed_sdf.sdfs[i].obj_factory.get_mesh())
+        mesh = copy.deepcopy(composed_sdf.sdfs[i].get_mesh_list()[0])
         mesh = mesh.transform(tsfs[i].cpu().numpy())
         meshes.append(mesh)
     return meshes

@@ -7,7 +7,7 @@ from pytorch_volumetric import sample_mesh_points
 TEST_DIR = os.path.dirname(__file__)
 
 
-def test_gradients_at_surface_pts(mesh):
+def do_test_gradients_at_surface_pts(mesh):
     d = "cuda" if torch.cuda.is_available() else "cpu"
 
     # press n to visualize the normals / gradients
@@ -89,7 +89,21 @@ def test_compose_sdf():
     o3d.visualization.draw_geometries([sdf.obj_factory._mesh, pcd])
 
 
-def do_test_cube_gradients():
+def test_cube_mesh_gradients():
+    obj = pv.MeshObjectFactory("cube.obj")
+    sdf = pv.MeshSDF(obj)
+    query_points = torch.tensor([
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [-1.0, 0.0, 0.0],
+        [0.0, -1.0, 0.0],
+        [0.0, 0.0, -1.0],
+    ])
+    sdf_vals, sdf_grads = sdf(query_points)
+    assert torch.allclose(sdf_grads, query_points)
+
+def test_cube_primitive_gradients():
     obj = pv.MeshObjectFactory("cube.obj")
     sdf = pv.MeshSDF(obj)
     query_points = torch.tensor([
@@ -104,12 +118,39 @@ def do_test_cube_gradients():
     assert torch.allclose(sdf_grads, query_points)
 
 
+def test_sphere_primitive_gradients():
+    sdf = pv.BoxSDF(extents=[1.0, 0.5, 1.0])
+    #sdf = pv.SphereSDF(radius=1.0)
+    query_points = torch.tensor([
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [-1.0, 0.0, 0.0],
+        [0.0, -1.0, 0.0],
+        [0.0, 0.0, -1.0],
+    ])
+    sdf_vals, sdf_grads = sdf(query_points)
+    query_range = torch.tensor([
+        [-1.5, -1.5, 0.0],
+        [1.5, 1.5, 0.0],
+    ]).T
+    pv.draw_sdf_slice(sdf, query_range, plot_grad=True)
+
+    points, _ = sdf.sample_surface_points(1000)
+    import matplotlib.pyplot as plt
+    #points = points[points[:, 2].abs() < 0.9]
+    plt.scatter(points[:, 0], points[:, 1])
+    plt.show()
+    assert torch.allclose(sdf_grads, query_points)
+
 def test_gradients_at_surface_pts():
     do_test_gradients_at_surface_pts("probe.obj")
     do_test_gradients_at_surface_pts("offset_wrench_nogrip.obj")
 
 
 if __name__ == "__main__":
-    test_cube_gradients()
-    test_gradients_at_surface_pts()
-    test_compose_sdf()
+    test_cube_mesh_gradients()
+    test_cube_primitive_gradients()
+    test_sphere_primitive_gradients()
+    #test_gradients_at_surface_pts()
+    ##test_compose_sdf()
