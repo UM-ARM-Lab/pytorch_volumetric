@@ -1,0 +1,30 @@
+<?xml version="0.0" ?>
+<robot name="model.urdf">
+  <link name="baseLink">
+    <contact>
+      <friction_anchor/>
+      <lateral_friction value="0.9"/>
+      <rolling_friction value="0.0"/>
+      <contact_cfm value="0.0"/>
+      <contact_erp value="1.0"/>
+    </contact>
+    <inertial>
+       <origin rpy="0 0 0.6" xyz="-0.005 0.01 0.06"/>
+       <mass value=".895"/>
+       <inertia ixx="1e-3" ixy="0" ixz="0" iyy="1e-3" iyz="0" izz="1e-3"/>
+    </inertial>
+    <visual>
+      <geometry>
+        <mesh filename="textured_simple_reoriented.obj" scale="1 1 1"/>
+      </geometry>
+      <material name="white">
+        <color rgba="1. 1. 1. 0.5"/>
+      </material>
+    </visual>
+    <collision>
+      <geometry>
+    	 	<mesh filename="collision_vhacd.obj" scale="1 1 1"/>
+      </geometry>
+    </collision>
+  </link>
+</robot>

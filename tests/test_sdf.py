@@ -57,6 +57,7 @@ def do_test_gradients_at_surface_pts(mesh):
     pcd.colors = o3d.utility.Vector3dVector(colors.cpu())
     o3d.visualization.draw_geometries([sdf.obj_factory._mesh, pcd])
 
+
 def test_compose_sdf():
     import pytorch_kinematics as pk
     d = "cuda" if torch.cuda.is_available() else "cpu"
@@ -67,8 +68,8 @@ def test_compose_sdf():
     sdf1 = pv.MeshSDF(obj)
     sdf2 = pv.MeshSDF(obj)
     # need to specify the transform of each SDF frame
-    tsf1 = pk.Translate(0.1, 0, 0)
-    tsf2 = pk.Translate(-0.2, 0, 0.2)
+    tsf1 = pk.Translate(0.1, 0, 0, device=d)
+    tsf2 = pk.Translate(-0.2, 0, 0.2, device=d)
     sdf = pv.ComposedSDF([sdf1, sdf2], tsf1.stack(tsf2))
     # sample points in the bounding box
 
@@ -85,7 +86,7 @@ def test_compose_sdf():
     colors[:, 0] = (sdf_vals - sdf_vals.min()) / (sdf_vals.max() - sdf_vals.min())
     colors[:, 1] = 1
     pcd.colors = o3d.utility.Vector3dVector(colors.cpu())
-    o3d.visualization.draw_geometries([sdf.obj_factory._mesh, pcd])
+    o3d.visualization.draw_geometries([sdf1.obj_factory._mesh, pcd])
 
 
 def test_gradients_at_surface_pts():
@@ -95,3 +96,4 @@ def test_gradients_at_surface_pts():
 
 if __name__ == "__main__":
     test_gradients_at_surface_pts()
+    test_compose_sdf()
