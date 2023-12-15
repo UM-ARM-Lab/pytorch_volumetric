@@ -15,7 +15,6 @@ visualize = True
 
 def do_test_chamfer_distance(mesh):
     d = "cuda" if torch.cuda.is_available() else "cpu"
-    device = d
     dtype = torch.float
     B = 300
     N = 1000

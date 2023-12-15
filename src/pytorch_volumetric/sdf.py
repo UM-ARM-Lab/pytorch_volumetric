@@ -79,6 +79,12 @@ class ObjectFactory(abc.ABC):
         ranges[:, 1] += padding
         return ranges
 
+    def center(self):
+        """Get center of mass assuming uniform density. Return is in object frame"""
+        if self._mesh is None:
+            self.precompute_sdf()
+        return self._mesh.get_center()
+
     def precompute_sdf(self):
         # scale mesh the approrpiate amount
         full_path = self.get_mesh_high_poly_resource_filename()
@@ -102,7 +108,7 @@ class ObjectFactory(abc.ABC):
         self._mesh.compute_triangle_normals()
         self._face_normals = np.asarray(self._mesh.triangle_normals)
 
-    @tensor_utils.handle_batch_input
+    @tensor_utils.handle_batch_input(n=2)
     def _do_object_frame_closest_point(self, points_in_object_frame, compute_normal=False):
         if self._mesh is None:
             self.precompute_sdf()

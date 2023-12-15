@@ -110,7 +110,7 @@ class RobotSDF(sdf.ObjectFrameSDF):
             offset_tsf = pk.Transform3d(matrix=offset_tsf_mat.reshape(-1, 4, 4))
 
         tsfs = torch.cat(tsfs)
-        self.object_to_link_frames = offset_tsf.compose(pk.Transform3d(matrix=tsfs.inverse()))
+        self.object_to_link_frames = offset_tsf.compose(pk.Transform3d(matrix=tsfs).inverse())
         if self.sdf is not None:
             self.sdf.set_transforms(self.object_to_link_frames, batch_dim=self.configuration_batch)
 
