@@ -376,7 +376,7 @@ class BoxSDF(ObjectFrameSDF):
         octant = torch.sign(points_in_object_frame)
 
         # radius for smoothing corners - for better gradients
-        radius = 0.01
+        radius = 0.005
 
         diff = torch.abs(points_in_object_frame) - (self.extents.unsqueeze(0) - radius)
         q = torch.clamp(diff, min=0)
@@ -480,6 +480,46 @@ class SphereSDF(ObjectFrameSDF):
         # normals are just the unit norm vectors in same direction as vector to points
         return points, points / self.radius
 
+class DeepSDF(ObjectFrameSDF):
+
+    def __init__(self, model):
+        self.sdf = model
+        from torch.func import jacrev, hessian
+        self.grad_sdf = jacrev(self.sdf)
+        #self.hess_sdf = hessian(self.sdf)
+
+    def surface_bounding_box(self, padding=0.):
+        raise NotImplementedError
+
+
+    def __call__(self, points_in_object_frame: torch.Tensor, return_extra_info=False):
+        p = points_in_object_frame.reshape(-1, 3)
+        points_shape = points_in_object_frame.shape
+        points_in_object_frame = points_in_object_frame.detach()
+        points_in_object_frame.requires_grad = True
+        sdf_val = self.sdf(points_in_object_frame.reshape(-1, 3))
+        sdf_grad = torch.autograd.grad(sdf_val.sum(), points_in_object_frame)[0]
+        points_in_object_frame = points_in_object_frame.detach()
+        points_in_object_frame.requires_grad = False
+        sdf_val = sdf_val.reshape(points_shape[:-1])
+        sdf_hess = torch.zeros(points_shape[:-1] + (3, 3), device=points_in_object_frame.device)
+
+        if return_extra_info:
+            return {
+                'sdf_val': sdf_val,
+                'sdf_grad': sdf_grad,
+                'sdf_hess': sdf_hess
+            }
+        return sdf_val.detach(), sdf_grad.detach()
+
+    def precompute_sdf(self):
+        pass
+
+    def get_mesh_list(self):
+        pass
+
+    def sample_surface_points(self, num_points, **kwargs):
+        raise NotImplementedError
 
 class ComposedSDF(ObjectFrameSDF):
     def __init__(self, sdfs: typing.Sequence[ObjectFrameSDF], obj_frame_to_each_frame: pk.Transform3d):
@@ -556,7 +596,7 @@ class ComposedSDF(ObjectFrameSDF):
             points_in_object_frame = points_in_object_frame.view(-1, 3)
             flat_shape = points_in_object_frame.shape
             # pts[i] are now points in the ith SDF's frame
-            pts = self.obj_frame_to_link_frame.transform_points(points_in_object_frame)
+            pts = self.obj_frame_to_link_frame.transform_points(points_in_object_frame).reshape(S, -1, 3)
 
         sdfv = []
         sdfg = []
@@ -662,15 +702,14 @@ class CachedSDF(ObjectFrameSDF):
 
         self.name = f"{object_name} {resolution} {tuple(range_per_dim)} {int(cache_sdf_hessian)}"
         self.debug_check_sdf = debug_check_sdf
-
         if os.path.exists(cache_path) and not clean_cache:
             data = torch.load(cache_path) or {}
             try:
-                cached_underlying_sdf, cached_underlying_sdf_grad = data[self.name]
+                cached_underlying_sdf, cached_underlying_sdf_grad, cached_underlying_sdf_hessian = data[self.name]
                 logger.info("cached sdf for %s loaded from %s", self.name, cache_path)
             except (ValueError, KeyError):
                 logger.info("cached sdf invalid %s from %s, recreating", self.name, cache_path)
-        else:
+        else:   
             data = {}
 
         # if we didn't load anything, then we need to create the cache and save to it
@@ -679,6 +718,7 @@ class CachedSDF(ObjectFrameSDF):
                 raise RuntimeError("Cached SDF did not find the cache and requires an initialize queryable SDF")
 
             coords, pts = get_coordinates_and_points_in_grid(self.resolution, self.ranges, device=self.device)
+
             if not cache_sdf_hessian:
                 sdf_val, sdf_grad = gt_sdf(pts)
             else:
@@ -690,7 +730,6 @@ class CachedSDF(ObjectFrameSDF):
 
             cached_underlying_sdf = sdf_val.reshape([len(coord) for coord in coords])
             cached_underlying_sdf_grad = sdf_grad.squeeze(0)
-
             # cached_underlying_sdf_grad = sdf_grad.reshape(cached_underlying_sdf.shape + (3,))
             # confirm the values work
             if self.debug_check_sdf:
@@ -706,10 +745,12 @@ class CachedSDF(ObjectFrameSDF):
 
         cached_underlying_sdf = cached_underlying_sdf.to(device=device)
         cached_underlying_sdf_grad = cached_underlying_sdf_grad.to(device=device)
+        print(cached_underlying_sdf_grad.shape)
         self.voxels = torch_view.TorchMultidimView(cached_underlying_sdf, range_per_dim,
                                                    invalid_value=self._fallback_sdf_value_func)
         self.voxels_grad = cached_underlying_sdf_grad.squeeze()
 
+        self.voxels_hessian = None
         if cached_underlying_sdf_hessian is not None:
             cached_underlying_sdf_hessian = cached_underlying_sdf_hessian.to(device=device)
             self.voxels_hessian = cached_underlying_sdf_hessian.squeeze()
@@ -737,11 +778,24 @@ class CachedSDF(ObjectFrameSDF):
 
         val[inbound_keys] = self.voxels.raw_data[keys_ravelled[inbound_keys]]
         grad[inbound_keys] = self.voxels_grad[keys_ravelled[inbound_keys]]
-        hess[inbound_keys] = self.voxels_hessian[keys_ravelled[inbound_keys]]
-        gt_result = self.gt_sdf(points_in_object_frame[out_of_bound_keys], return_extra_info=True)
-        val[out_of_bound_keys] = gt_result['sdf_val']
-        grad[out_of_bound_keys] = gt_result['sdf_grad']
-        hess[out_of_bound_keys] = gt_result['sdf_hess']
+        #print(points_in_object_frame.shape)
+        #print('--')
+        # print(torch.max(points_in_object_frame.reshape(-1, 3), dim=0))
+        # print(torch.min(points_in_object_frame.reshape(-1, 3), dim=0))
+        # 
+        # 
+        # print(torch.sum(inbound_keys))
+        # print(torch.sum(out_of_bound_keys))
+        if self.voxels_hessian is not None:
+            hess[inbound_keys] = self.voxels_hessian[keys_ravelled[inbound_keys]]
+            gt_result = self.gt_sdf(points_in_object_frame[out_of_bound_keys], return_extra_info=True)
+            val[out_of_bound_keys] = gt_result['sdf_val']
+            grad[out_of_bound_keys] = gt_result['sdf_grad']
+            hess[out_of_bound_keys] = gt_result['sdf_hess']
+        else:
+            gt_result = self.gt_sdf(points_in_object_frame[out_of_bound_keys], return_extra_info=False)
+            val[out_of_bound_keys], grad[out_of_bound_keys] = gt_result
+            hess = None
 
         if self.debug_check_sdf:
             val_gt = self._fallback_sdf_value_func(points_in_object_frame)

@@ -50,7 +50,7 @@ class RobotScene:
         self.transform_world_to_scene = vmap(self._transform_world_to_scene)
 
         self.grad_smooth_points = 10
-        # self.grad_points = vmap(jacrev(self._transform_points))
+        self.grad_points = vmap(jacrev(self._transform_points))
         # self.hess_points = vmap(jacfwd(jacrev(self._transform_points)))
 
     def _get_desired_tfs(self):
@@ -161,7 +161,8 @@ class RobotScene:
         sdf_vals = sdf_result['sdf_val']
         sdf_grads = sdf_result['sdf_grad']
         sdf_hess = sdf_result['sdf_hess']
-        sdf_hess = sdf_hess.reshape(B, -1, 3, 3)
+        if sdf_hess is not None:
+            sdf_hess = sdf_hess.reshape(B, -1, 3, 3)
 
         # get minimum links
         sdf_vals = sdf_vals.reshape(B, -1)
@@ -180,7 +181,7 @@ class RobotScene:
             closest_sdf_grads = sdf_grads[B_range, closest_indices]
             closest_sdf_vals = sdf_vals[B_range, closest_indices]
             h = torch.softmax(-self.softmin_temp * closest_sdf_vals, dim=1)
-            new_grad = True
+            new_grad = False
             pts_hessian = None
             if new_grad:
                 closest_pts = pts.reshape(B, -1, 3)[B_range, closest_indices].reshape(-1, 3)
@@ -197,13 +198,16 @@ class RobotScene:
                     pts_hessian = pts_hessian[:, :3].reshape(B, self.grad_smooth_points, 3, q.shape[1], q.shape[1])
 
                 pts_jacobian = pts_jacobian[:, :3].reshape(B, self.grad_smooth_points, 3, -1)
+                sdf_weighted_grad = h[:, :, None] * closest_sdf_grads
+                q_grad = (pts_jacobian.transpose(2, 3) @ sdf_weighted_grad.unsqueeze(-1)).squeeze(-1)
+                rvals['grad_sdf'] = torch.sum(q_grad, dim=1)  # B x 14
 
             else:
+                h = torch.softmax(-self.softmin_temp * sdf_vals, dim=1)
                 pts_jacobian = self.grad_points(q, h)  # B x 3 x 14
-
-            sdf_weighted_grad = h[:, :, None] * closest_sdf_grads
-            q_grad = (pts_jacobian.transpose(2, 3) @ sdf_weighted_grad.unsqueeze(-1)).squeeze(-1)
-            rvals['grad_sdf'] = torch.sum(q_grad, dim=1)  # B x 14
+                sdf_weighted_grad = torch.sum(h[:, :, None] * sdf_grads, dim=1)
+                q_grad = (pts_jacobian.transpose(1, 2) @ sdf_weighted_grad.unsqueeze(-1)).squeeze(-1)
+                rvals['grad_sdf'] = q_grad  # B x 14
 
             if compute_hessian:
                 if pts_hessian is None:
