@@ -161,6 +161,7 @@ class ObjectFactory(abc.ABC):
 
             # points is (B, 3)
             pts_perturbed = points_in_object_frame[:, None, :] + perturbation[None, :, :]
+            pts_perturbed = pts_perturbed.reshape(-1, 3, 2, 3).transpose(0, 2, 3, 1)
             _, _, perturbed_grad, _, _ = self._do_object_frame_closest_point(pts_perturbed.reshape(-1, 3),
                                                                              compute_normal=False,
                                                                              compute_hessian=False)
@@ -381,10 +382,10 @@ class BoxSDF(ObjectFrameSDF):
         diff = torch.abs(points_in_object_frame) - (self.extents.unsqueeze(0) - radius)
         q = torch.clamp(diff, min=0)
         l = torch.linalg.norm(q, dim=-1)
+
         max_component, max_component_idx = torch.max(diff, dim=-1)
         sdf_value = torch.where(max_component > 0.0,
                                 l - radius, max_component - radius)
-
         # compute sdf grad as if we are inside the obstacle
         sdf_grad = torch.zeros(N, d, device=points_in_object_frame.device)
         sdf_grad[torch.arange(N), max_component_idx] = 1.0
@@ -421,6 +422,114 @@ class BoxSDF(ObjectFrameSDF):
     def get_mesh_list(self):
         extents = self.extents.cpu().numpy()
         return [o3d.geometry.TriangleMesh.create_box(*(2 * extents)).translate(-extents)]
+
+    def sample_surface_points(self, num_points, device='cpu', **kwargs):
+        # because our object is so straightforward we should be able to use a single gradient step on the sdf
+        # get points in unit box
+        # randomly generate points in unit box
+        points = torch.rand(num_points, 3, device=device) * 2 - 1
+
+        sdf_val, sdf_grad = self(points)
+
+        new_points = points - sdf_val.unsqueeze(-1) * sdf_grad
+        new_sdf_val, new_sdf_grad = self(new_points)
+
+        return new_points, new_sdf_grad
+
+
+class CylinderSDF(ObjectFrameSDF):
+    """
+    Cylinder SDF
+
+    Cylinder is defined as a cylinder with radius r and length l along the y-axis
+
+    """
+
+    def __init__(self, radius, length, vis=None, device='cpu'):
+        self.r = radius
+        self.l = length / 2
+        self.vis = vis
+        self.device = device
+
+    def surface_bounding_box(self, padding=0.):
+        return torch.tensor([[-self.r - padding, -self.l - padding, -self.r - padding],
+                             [self.r + padding, self.l + padding, self.r + padding]])
+
+    def _get_sdf(self, points_in_object_frame):
+        rounded_rad = 1e-3
+
+        p_xz = points_in_object_frame[..., (0, 2)]
+        p_y = points_in_object_frame[..., 1]
+
+        diff = torch.zeros_like(p_xz)
+        diff[..., 0] = torch.linalg.norm(p_xz, dim=-1) - self.r + rounded_rad
+        diff[..., 1] = torch.abs(p_y) - self.l
+
+        sdf_value = torch.clamp(torch.max(diff, dim=-1).values, max=0)
+        sdf_value = sdf_value + torch.linalg.norm(torch.clamp(diff, min=0), dim=-1) - rounded_rad
+        return sdf_value
+
+    def _get_sdf_grad(self, points_in_object_frame):
+        # TODO: it is probably possible to do this analytically, use finite differencing for now
+        h = 1e-4
+        N = len(points_in_object_frame) - 1
+        perturbation = h * torch.stack([torch.eye(3, device=self.device),
+                                        -torch.eye(3, device=self.device)], dim=1).reshape(-1, 3)
+
+        expand = [1] * N
+        # perturb the points
+        pts_perturbed = points_in_object_frame[..., None, :] + perturbation.reshape(*expand, -1, 3)
+        pts_perturbed = pts_perturbed.reshape(-1, 3, 2, 3).permute(0, 2, 3, 1)
+
+        sdf_vals = self._get_sdf(pts_perturbed.reshape(-1, 3)).reshape(-1, 2, 3)
+        grad = (sdf_vals[:, 0, :] - sdf_vals[:, 1, :]) / (2 * h)
+        norm_grad = torch.linalg.norm(grad, dim=-1, keepdim=True)
+        # normalize
+        grad = torch.where(norm_grad > 1e-4, grad / norm_grad, torch.zeros_like(grad))
+        return grad
+
+    def __call__(self, points_in_object_frame, return_extra_info=False):
+        N, d = points_in_object_frame.shape[-2:]
+
+        sdf_value = self._get_sdf(points_in_object_frame)
+        sdf_grad = self._get_sdf_grad(points_in_object_frame)
+
+        # TODO: Including radius of corners results in a non-zero hessian around corners, perhaps compute that?
+        sdf_value = sdf_value.reshape(*points_in_object_frame.shape[:-1])
+        sdf_grad = sdf_grad.reshape(*points_in_object_frame.shape[:-1], d)
+        sdf_hess = torch.zeros(*points_in_object_frame.shape[:-1], d, d, device=points_in_object_frame.device)
+
+        # points are transformed to link frame, thus it needs to compare against the object in link frame
+        # objId is not in link frame and shouldn't be moved
+        if self.vis is not None:
+            for i in range(N):
+                self.vis.draw_point("test_point", points_in_object_frame[..., i, :], color=(1, 0, 0), length=0.005)
+                self.vis.draw_point("test_point_surf", sdf_value[..., i, :].detach().cpu(), color=(0, 1, 0),
+                                    length=0.005,
+                                    label=f'{sdf_value[..., i].item():.5f}')
+        if return_extra_info:
+            return {
+                'sdf_val': sdf_value,
+                'sdf_grad': sdf_grad,
+                'sdf_hess': sdf_hess
+            }
+
+        return sdf_value, sdf_grad
+
+    def precompute_sdf(self):
+        pass
+
+    def get_mesh_list(self):
+        # the open3d cylinder primitive is defined as a cylinder with radius r and length l along the z-axis
+        # so we need to rotate it
+        mesh = o3d.geometry.TriangleMesh.create_cylinder(radius=self.r, height=2 * self.l)
+        R = np.array([
+            [1, 0, 0],
+            [0, 0, 1],
+            [0, 1, 0]
+        ])
+        mesh.rotate(R, center=[0, 0, 0])
+        return [mesh]
 
     def sample_surface_points(self, num_points, device='cpu', **kwargs):
         # because our object is so straightforward we should be able to use a single gradient step on the sdf
@@ -480,17 +589,17 @@ class SphereSDF(ObjectFrameSDF):
         # normals are just the unit norm vectors in same direction as vector to points
         return points, points / self.radius
 
+
 class DeepSDF(ObjectFrameSDF):
 
     def __init__(self, model):
         self.sdf = model
         from torch.func import jacrev, hessian
         self.grad_sdf = jacrev(self.sdf)
-        #self.hess_sdf = hessian(self.sdf)
+        # self.hess_sdf = hessian(self.sdf)
 
     def surface_bounding_box(self, padding=0.):
         raise NotImplementedError
-
 
     def __call__(self, points_in_object_frame: torch.Tensor, return_extra_info=False):
         p = points_in_object_frame.reshape(-1, 3)
@@ -520,6 +629,7 @@ class DeepSDF(ObjectFrameSDF):
 
     def sample_surface_points(self, num_points, **kwargs):
         raise NotImplementedError
+
 
 class ComposedSDF(ObjectFrameSDF):
     def __init__(self, sdfs: typing.Sequence[ObjectFrameSDF], obj_frame_to_each_frame: pk.Transform3d):
@@ -709,7 +819,7 @@ class CachedSDF(ObjectFrameSDF):
                 logger.info("cached sdf for %s loaded from %s", self.name, cache_path)
             except (ValueError, KeyError):
                 logger.info("cached sdf invalid %s from %s, recreating", self.name, cache_path)
-        else:   
+        else:
             data = {}
 
         # if we didn't load anything, then we need to create the cache and save to it
@@ -745,7 +855,6 @@ class CachedSDF(ObjectFrameSDF):
 
         cached_underlying_sdf = cached_underlying_sdf.to(device=device)
         cached_underlying_sdf_grad = cached_underlying_sdf_grad.to(device=device)
-        print(cached_underlying_sdf_grad.shape)
         self.voxels = torch_view.TorchMultidimView(cached_underlying_sdf, range_per_dim,
                                                    invalid_value=self._fallback_sdf_value_func)
         self.voxels_grad = cached_underlying_sdf_grad.squeeze()
@@ -778,8 +887,8 @@ class CachedSDF(ObjectFrameSDF):
 
         val[inbound_keys] = self.voxels.raw_data[keys_ravelled[inbound_keys]]
         grad[inbound_keys] = self.voxels_grad[keys_ravelled[inbound_keys]]
-        #print(points_in_object_frame.shape)
-        #print('--')
+        # print(points_in_object_frame.shape)
+        # print('--')
         # print(torch.max(points_in_object_frame.reshape(-1, 3), dim=0))
         # print(torch.min(points_in_object_frame.reshape(-1, 3), dim=0))
         # 

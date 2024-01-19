@@ -46,7 +46,8 @@ class RobotSDF(sdf.ObjectFrameSDF):
             frame = self.chain.find_frame(frame_name)
             # TODO create SDF for non-mesh primitives
             # TODO consider the visual offset transform
-            supported_types = ["mesh", "box", "sphere"]
+            supported_types = ["mesh", "box", "sphere", "cylinder", None]
+
             if use_collision_geometry:
                 link_geometries = frame.link.collisions
             else:
@@ -64,8 +65,14 @@ class RobotSDF(sdf.ObjectFrameSDF):
                         link_sdf = link_sdf_cls(link_obj)
                     elif link_geom.geom_type == "box":
                         link_sdf = sdf.BoxSDF(link_geom.geom_param, device=self.device)
-                    else:
+                    elif link_geom.geom_type == "cylinder":
+                        link_sdf = sdf.CylinderSDF(link_geom.geom_param[0],
+                                                   link_geom.geom_param[1], device=self.device)
+                    elif link_geom.geom_type == "sphere":
                         link_sdf = sdf.SphereSDF(link_geom.geom_param, device=self.device)
+                    else:
+                        # this is the None type
+                        continue
                     self.sdf_to_link_name.append(frame.link.name)
                     self.sdf_index_to_frame_index.append(self.chain.frame_to_idx[frame_name])
                     sdfs.append(link_sdf)
