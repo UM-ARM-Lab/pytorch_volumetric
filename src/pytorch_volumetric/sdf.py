@@ -376,7 +376,7 @@ class BoxSDF(ObjectFrameSDF):
         octant = torch.sign(points_in_object_frame)
 
         # radius for smoothing corners - for better gradients
-        radius = 0.005
+        radius = 0.001
 
         diff = torch.abs(points_in_object_frame) - (self.extents.unsqueeze(0) - radius)
         q = torch.clamp(diff, min=0)

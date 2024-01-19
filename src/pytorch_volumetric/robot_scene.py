@@ -173,6 +173,7 @@ class RobotScene:
         rvals = {
             'sdf': sdf_val,
         }
+
         if compute_gradient:
             # rather than take a single point we use the softmin to get a weighted average of the gradients for
             # the self.grad_smooth_points number of closest points, this helps smooth the gradient
@@ -184,7 +185,8 @@ class RobotScene:
             new_grad = False
             pts_hessian = None
             if new_grad:
-                closest_pts = pts.reshape(B, -1, 3)[B_range, closest_indices].reshape(-1, 3)
+                # want the closest points in the link frame
+                closest_pts = self.robot_query_points.reshape(B, -1, 3)[B_range, closest_indices].reshape(-1, 3)
                 closest_links = self.desired_frame_idx[closest_indices // self.points_per_link].reshape(-1)
                 q_repeat = q.unsqueeze(1).repeat(1, self.grad_smooth_points, 1).reshape(B * self.grad_smooth_points, -1)
                 if not compute_hessian:
@@ -193,27 +195,39 @@ class RobotScene:
                                                                  link_indices=closest_links)
                 else:
                     pts_jacobian, pts_hessian = self.robot_sdf.chain.jacobian_and_hessian(q_repeat,
-                                                                                          locations=closest_pts,
+                                                                                          locations=0 * closest_pts,
                                                                                           link_indices=closest_links)
                     pts_hessian = pts_hessian[:, :3].reshape(B, self.grad_smooth_points, 3, q.shape[1], q.shape[1])
 
                 pts_jacobian = pts_jacobian[:, :3].reshape(B, self.grad_smooth_points, 3, -1)
                 sdf_weighted_grad = h[:, :, None] * closest_sdf_grads
-                q_grad = (pts_jacobian.transpose(2, 3) @ sdf_weighted_grad.unsqueeze(-1)).squeeze(-1)
+                # transform gradient to world frame
+                sdf_grad_world_frame = self.scene_transform.transform_normals(
+                    sdf_weighted_grad.reshape(-1, 3)).reshape(B, self.grad_smooth_points, 3)
+
+                q_grad = (pts_jacobian.transpose(2, 3) @ sdf_grad_world_frame.unsqueeze(-1)).squeeze(-1)
                 rvals['grad_sdf'] = torch.sum(q_grad, dim=1)  # B x 14
 
             else:
                 h = torch.softmax(-self.softmin_temp * sdf_vals, dim=1)
                 pts_jacobian = self.grad_points(q, h)  # B x 3 x 14
+                # this jacobian is in the scene frame, so don't need to transform gradient
                 sdf_weighted_grad = torch.sum(h[:, :, None] * sdf_grads, dim=1)
                 q_grad = (pts_jacobian.transpose(1, 2) @ sdf_weighted_grad.unsqueeze(-1)).squeeze(-1)
                 rvals['grad_sdf'] = q_grad  # B x 14
 
             if compute_hessian:
-                if pts_hessian is None:
-                    pts_hessian = self.hess_points(q, h)
                 closest_sdf_hess = sdf_hess[B_range, closest_indices]
                 sdf_weighted_hess = h[:, :, None, None] * closest_sdf_hess
+                if pts_hessian is None:
+                    pts_hessian = self.hess_points(q, h)
+                else:
+                    # transform grad and hess into world frame, bc jacobian and hessian are in world frame
+                    sdf_weighted_grad = self.scene_transform.transform_normals(
+                        sdf_weighted_grad.reshape(-1, 3)).reshape(B, self.grad_smooth_points, 3)
+                    sdf_weighted_hess = self.scene_transform.transform_shape_operator(
+                        sdf_weighted_hess.reshape(-1, 3, 3)).reshape(B, self.grad_smooth_points, 3, 3)
+
                 q_hess = torch.sum(pts_hessian * sdf_weighted_grad.reshape(B, -1, 3, 1, 1), dim=2)
                 q_hess2 = pts_jacobian.transpose(2, 3) @ sdf_weighted_hess @ pts_jacobian
                 q_hess = q_hess + q_hess2
@@ -269,7 +283,9 @@ class RobotScene:
             h = torch.softmax(-self.softmin_temp * closest_sdf_vals, dim=1)
             new_grad = True
             pts_hessian = None
-            closest_pts = pts.reshape(B, -1, 3)[B_range, closest_indices].reshape(-1, 3)
+
+            # want the closest points in the link frame
+            closest_pts = self.robot_query_points.repeat(B, 1, 1)[B_range, closest_indices].reshape(-1, 3)
             closest_links = self.desired_frame_idx[closest_indices // self.points_per_link].reshape(-1)
             q_repeat = q.unsqueeze(1).repeat(1, self.grad_smooth_points, 1).reshape(B * self.grad_smooth_points, -1)
 
@@ -288,6 +304,7 @@ class RobotScene:
                 rob_jacobian, rob_hessian = self.robot_sdf.chain.jacobian_and_hessian(q_repeat,
                                                                                       locations=closest_pts,
                                                                                       link_indices=closest_links)
+
                 env_jacobian, env_hessian = self.scene_sdf.chain.jacobian_and_hessian(env_q_repeat,
                                                                                       locations=closest_pts,
                                                                                       link_indices=closest_env_links)
@@ -299,7 +316,12 @@ class RobotScene:
             env_jacobian = env_jacobian[:, :3].reshape(B, self.grad_smooth_points, 3, -1)
 
             sdf_weighted_grad = h[:, :, None] * closest_sdf_grads
-            q_grad = (rob_jacobian.transpose(2, 3) @ sdf_weighted_grad.unsqueeze(-1)).squeeze(-1)
+
+            # transform gradient to world frame
+            sdf_grad_world_frame = self.scene_transform.transform_normals(
+                sdf_weighted_grad.reshape(-1, 3)).reshape(B, self.grad_smooth_points, 3)
+
+            q_grad = (rob_jacobian.transpose(2, 3) @ sdf_grad_world_frame.unsqueeze(-1)).squeeze(-1)
             q_env_grad = (env_jacobian.transpose(2, 3) @ -sdf_weighted_grad.unsqueeze(-1)).squeeze(-1)
 
             rvals['grad_sdf'] = torch.sum(q_grad, dim=1)  # B x 14
@@ -308,14 +330,18 @@ class RobotScene:
             if compute_hessian:
                 closest_sdf_hess = sdf_hess[B_range, closest_indices]
                 sdf_weighted_hess = h[:, :, None, None] * closest_sdf_hess
-                q_hess = torch.sum(rob_hessian * sdf_weighted_grad.reshape(B, -1, 3, 1, 1), dim=2)
-                q_hess2 = rob_jacobian.transpose(2, 3) @ sdf_weighted_hess @ rob_jacobian
+                sdf_hess_world_frame = self.scene_transform.transform_shape_operator(
+                    sdf_weighted_hess.reshape(-1, 3, 3)).reshape(B, self.grad_smooth_points, 3, 3)
+
+                q_hess = torch.sum(rob_hessian * sdf_grad_world_frame.reshape(B, -1, 3, 1, 1), dim=2)
+                q_hess2 = rob_jacobian.transpose(2, 3) @ sdf_hess_world_frame @ rob_jacobian
                 q_hess = q_hess + q_hess2
                 rvals['hess_sdf'] = torch.sum(q_hess, dim=1)
                 q_env_hess = torch.sum(env_hessian * -sdf_weighted_grad.reshape(B, -1, 3, 1, 1), dim=2)
                 q_env_hess2 = env_jacobian.transpose(2, 3) @ -sdf_weighted_hess @ env_jacobian
                 q_env_hess = q_env_hess + q_env_hess2
                 rvals['hess_env_sdf'] = torch.sum(q_env_hess, dim=1)
+
         return rvals
 
     def scene_collision_check(self, q: torch.Tensor, env_q=None,
@@ -340,6 +366,8 @@ class RobotScene:
            :param compute_gradient: bool whether to compute gradient of sdf wrt joint angles
            :param compute_hessian: bool whether to compute hessian of sdf wrt joint angles
            """
+        raise NotImplementedError("Not correctly implemented yet")
+        # TODO: this is not correct yet, currently function uses scene transforms
         rvals = self._collision_check_against_robot_sdf(q, q, self.robot_sdf, compute_gradient, compute_hessian)
         # Combine gradients
         if compute_gradient:
