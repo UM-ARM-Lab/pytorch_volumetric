@@ -92,6 +92,9 @@ class ExpandingVoxelGrid(VoxelGrid):
                     range_per_dim[dim][1] += math.ceil(over / self.resolution) * self.resolution
                 if under > 0:
                     range_per_dim[dim][0] -= math.ceil(under / self.resolution) * self.resolution
+                if over == 0 and under == 0:
+                    range_per_dim[dim][0] -= self.resolution
+                    range_per_dim[dim][1] += self.resolution
             if not np.allclose(range_per_dim, self.range_per_dim):
                 # transfer over values
                 known_pos, known_values = self.get_known_pos_and_values()
