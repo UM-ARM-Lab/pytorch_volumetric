@@ -117,7 +117,7 @@ class VoxelSet(Voxels):
         return self.positions, self.values
 
 
-def voxel_down_sample(points, resolution, range_per_dim=None):
+def voxel_down_sample(points, resolution, range_per_dim=None, ignore_flat_dim=False):
     """
     Down sample point clouds to the center of a voxel grid with a given resolution.
     Much faster than open3d's voxel_down_sample but at the cost of more memory usage since they
@@ -132,8 +132,18 @@ def voxel_down_sample(points, resolution, range_per_dim=None):
         range_per_dim = np.stack(
             (points.min(dim=0)[0].cpu().numpy(), points.max(dim=0)[0].cpu().numpy())).T
 
+    # special case for flat dimensions; assumes only last dimension can be flat
+    flat_z = ignore_flat_dim and range_per_dim[-1][0] == range_per_dim[-1][1]
+    flat_z_val = range_per_dim[-1][0]
+    if flat_z:
+        range_per_dim = range_per_dim[:-1]
+        points = points[..., :-1]
+
     device = points.device
-    voxel = VoxelGrid(resolution, range_per_dim, device=device)
+    voxel = VoxelGrid(resolution, range_per_dim, device=device, dtype=torch.bool)
     voxel[points] = 1
     pts, _ = voxel.get_known_pos_and_values()
+
+    if flat_z:
+        pts = torch.cat((pts, torch.ones((pts.shape[0], 1), device=device) * flat_z_val), dim=-1)
     return pts
