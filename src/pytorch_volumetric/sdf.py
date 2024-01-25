@@ -66,7 +66,7 @@ class ObjectFactory(abc.ABC):
         return dd.draw_mesh(name, self.get_mesh_resource_filename(), pose, scale=self.scale, rgba=rgba,
                             object_id=object_id, vis_frame_pos=frame_pos, vis_frame_rot=self.vis_frame_rot)
 
-    def bounding_box(self, padding=0.):
+    def bounding_box(self, padding=0., padding_ratio=0.):
         if self._mesh is None:
             self.precompute_sdf()
 
@@ -75,8 +75,9 @@ class ObjectFactory(abc.ABC):
         world_max = aabb.get_max_bound()
         # already scaled, but we add a little padding
         ranges = np.array(list(zip(world_min, world_max)))
-        ranges[:, 0] -= padding
-        ranges[:, 1] += padding
+        extents = ranges[:, 1] - ranges[:, 0]
+        ranges[:, 0] -= padding + padding_ratio * extents
+        ranges[:, 1] += padding + padding_ratio * extents
         return ranges
 
     def center(self):
@@ -216,10 +217,11 @@ class ObjectFrameSDF(abc.ABC):
         """
 
     @abc.abstractmethod
-    def surface_bounding_box(self, padding=0.):
+    def surface_bounding_box(self, padding=0., padding_ratio=0.):
         """
         Get the bounding box for the 0-level set in the form of a sequence of (min,max) coordinates
         :param padding: amount to inflate the min and max from the actual bounding box
+        :param padding_ratio: ratio of the extent of that dimension to use for padding; added on top of absolute padding
         :return: (min,max) for each dimension
         """
 
@@ -279,8 +281,8 @@ class MeshSDF(ObjectFrameSDF):
         self.obj_factory = obj_factory
         self.vis = vis
 
-    def surface_bounding_box(self, padding=0.):
-        return torch.tensor(self.obj_factory.bounding_box(padding))
+    def surface_bounding_box(self, **kwargs):
+        return torch.tensor(self.obj_factory.bounding_box(**kwargs))
 
     def __call__(self, points_in_object_frame):
         N, d = points_in_object_frame.shape[-2:]
@@ -317,11 +319,11 @@ class ComposedSDF(ObjectFrameSDF):
         self.tsf_batch = None
         self.set_transforms(obj_frame_to_each_frame)
 
-    def surface_bounding_box(self, padding=0.):
+    def surface_bounding_box(self, **kwargs):
         bounds = []
         tsf = self.obj_frame_to_link_frame.inverse()
         for i, sdf in enumerate(self.sdfs):
-            pts = sdf.surface_bounding_box(padding=padding)
+            pts = sdf.surface_bounding_box(**kwargs)
             pts = tsf[self.ith_transform_slice(i)].transform_points(
                 pts.to(dtype=tsf.dtype, device=tsf.device).transpose(0, 1))
             # edge case where the batch is a single element
@@ -478,8 +480,8 @@ class CachedSDF(ObjectFrameSDF):
                                                    invalid_value=self._fallback_sdf_value_func)
         self.voxels_grad = cached_underlying_sdf_grad.squeeze()
 
-    def surface_bounding_box(self, padding=0.):
-        return self.gt_sdf.surface_bounding_box(padding)
+    def surface_bounding_box(self, **kwargs):
+        return self.gt_sdf.surface_bounding_box(**kwargs)
 
     def _fallback_sdf_value_func(self, *args, **kwargs):
         sdf_val, _ = self.gt_sdf(*args, **kwargs)

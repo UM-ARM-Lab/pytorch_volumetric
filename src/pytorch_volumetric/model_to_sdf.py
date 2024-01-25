@@ -59,8 +59,8 @@ class RobotSDF(sdf.ObjectFrameSDF):
         self.sdf = sdf.ComposedSDF(sdfs, self.object_to_link_frames)
         self.set_joint_configuration(default_joint_config)
 
-    def surface_bounding_box(self, padding=0.):
-        return self.sdf.surface_bounding_box(padding=padding)
+    def surface_bounding_box(self, **kwargs):
+        return self.sdf.surface_bounding_box(**kwargs)
 
     def link_bounding_boxes(self):
         """
