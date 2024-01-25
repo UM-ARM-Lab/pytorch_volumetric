@@ -39,6 +39,13 @@ sdf = pv.MeshSDF(obj)
 cached_sdf = pv.CachedSDF('drill', resolution=0.01, range_per_dim=obj.bounding_box(padding=0.1), gt_sdf=sdf)
 ```
 
+By default, query points outside the cache will be compared against the object bounding box.
+To instead use the ground truth SDF, pass `out_of_bounds_strategy=pv.OutOfBoundsStrategy.LOOKUP_GT_SDF` to 
+the constructor.
+
+Note that the bounding box comparison will always under-approximate the SDF value, but empirically it is sufficient
+for most applications when querying out of bound points. It is **dramatically faster** than using the ground truth SDF.
+
 ### Composed SDF
 Multiple SDFs can be composed together to form an SDF that is convenient to query. This may be because your scene
 is composed of multiple objects and you have them as separate meshes. Note: the objects should not be overlapping or

@@ -1,4 +1,5 @@
 import abc
+import enum
 import math
 import os
 import typing
@@ -408,10 +409,17 @@ class ComposedSDF(ObjectFrameSDF):
         return vv, gg
 
 
+class OutOfBoundsStrategy(enum.Enum):
+    LOOKUP_GT_SDF = 0
+    BOUNDING_BOX = 1  # will also always under-approximate the SDF value, but more accurate than sphere approximation
+
+
 class CachedSDF(ObjectFrameSDF):
     """SDF via looking up precomputed voxel grids requiring a ground truth SDF to default to on uncached queries."""
 
-    def __init__(self, object_name, resolution, range_per_dim, gt_sdf: ObjectFrameSDF, device="cpu", clean_cache=False,
+    def __init__(self, object_name, resolution, range_per_dim, gt_sdf: ObjectFrameSDF,
+                 out_of_bounds_strategy=OutOfBoundsStrategy.BOUNDING_BOX,
+                 device="cpu", clean_cache=False,
                  debug_check_sdf=False, cache_path="sdf_cache.pkl"):
         """
 
@@ -419,6 +427,9 @@ class CachedSDF(ObjectFrameSDF):
         :param resolution: side length of each voxel cell
         :param range_per_dim: (min, max) sequence for each dimension (e.g. 3 for 3D)
         :param gt_sdf: ground truth SDF used to generate the cache and default to on queries outside of the cache
+        :param out_of_bounds_strategy: what to do when a query is outside the cached range.
+        LOOKUP_GT_SDF: use the ground truth SDF for the value and gradient (relatively expensive)
+        BOUNDING_BOX: use the distance to the bounding box (under-approximates the SDF value)
         :param device: pytorch compatible device
         :param clean_cache: whether to ignore the existing cache and force recomputation
         :param debug_check_sdf: check that the generated SDF matches the ground truth SDF
@@ -429,6 +440,7 @@ class CachedSDF(ObjectFrameSDF):
         self.voxels = None
         # voxel grid can't handle vector values yet
         self.voxels_grad = None
+        self.out_of_bounds_strategy = out_of_bounds_strategy
 
         cached_underlying_sdf = None
         cached_underlying_sdf_grad = None
@@ -480,6 +492,8 @@ class CachedSDF(ObjectFrameSDF):
                                                    invalid_value=self._fallback_sdf_value_func)
         self.voxels_grad = cached_underlying_sdf_grad.squeeze()
 
+        self.bb = self.surface_bounding_box().to(device=device)
+
     def surface_bounding_box(self, **kwargs):
         return self.gt_sdf.surface_bounding_box(**kwargs)
 
@@ -496,13 +510,46 @@ class CachedSDF(ObjectFrameSDF):
         inbound_keys = self.voxels.get_valid_values(points_in_object_frame)
         out_of_bound_keys = ~inbound_keys
 
+        # logger.info(f"out of bound keys: {out_of_bound_keys.sum()}/{out_of_bound_keys.numel()}")
+
         dtype = points_in_object_frame.dtype
         val = torch.zeros(keys_ravelled.shape, device=self.device, dtype=dtype)
         grad = torch.zeros(keys.shape, device=self.device, dtype=dtype)
 
         val[inbound_keys] = self.voxels.raw_data[keys_ravelled[inbound_keys]]
         grad[inbound_keys] = self.voxels_grad[keys_ravelled[inbound_keys]]
-        val[out_of_bound_keys], grad[out_of_bound_keys] = self.gt_sdf(points_in_object_frame[out_of_bound_keys])
+
+        points_oob = points_in_object_frame[out_of_bound_keys]
+        if self.out_of_bounds_strategy == OutOfBoundsStrategy.LOOKUP_GT_SDF:
+            val[out_of_bound_keys], grad[out_of_bound_keys] = self.gt_sdf(points_oob)
+        elif self.out_of_bounds_strategy == OutOfBoundsStrategy.BOUNDING_BOX:
+            if self.bb.dtype != dtype:
+                self.bb = self.bb.to(dtype=dtype)
+            # distance to bounding box
+            dmin = self.bb[:, 0] - points_oob
+            dmin_active = dmin > 0
+            dmin[~dmin_active] = 0
+            dmax = points_oob - self.bb[:, 1]
+            dmax_active = dmax > 0
+            dmax[~dmax_active] = 0
+            dtotal = dmin + dmax
+            # convert to gradient; for dmin, the dtotal component should be negative; for dmax, positive
+            dtotal[dmin_active] = -dtotal[dmin_active]
+            dist = dtotal.norm(dim=-1)
+            # normalize gradient
+            grad[out_of_bound_keys] = dtotal / dist.unsqueeze(-1)
+            val[out_of_bound_keys] = dist
+
+            # comparison with ground truth
+            if self.debug_check_sdf:
+                val_gt, grad_gt = self.gt_sdf(points_oob)
+                diff = val_gt - val[out_of_bound_keys]
+                # always under-approximate the SDF value
+                assert torch.all(diff > 0)
+                # cosine similarity to compare the gradient vectors
+                diff_grad = torch.cosine_similarity(grad_gt, grad[out_of_bound_keys], dim=-1)
+                assert torch.all(diff_grad > 0.7)
+                assert diff_grad.mean() > 0.95
 
         if self.debug_check_sdf:
             val_gt = self._fallback_sdf_value_func(points_in_object_frame)
