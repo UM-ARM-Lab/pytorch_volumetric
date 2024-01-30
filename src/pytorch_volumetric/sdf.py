@@ -102,7 +102,7 @@ class ObjectFactory(abc.ABC):
         self._mesh.compute_triangle_normals()
         self._face_normals = np.asarray(self._mesh.triangle_normals)
 
-    @tensor_utils.handle_batch_input
+    @tensor_utils.handle_batch_input(n=2)
     def _do_object_frame_closest_point(self, points_in_object_frame, compute_normal=False):
         if self._mesh is None:
             self.precompute_sdf()
@@ -170,7 +170,7 @@ class ObjectFactory(abc.ABC):
         gradient at the query point if the query point is outside, otherwise it's the positive SDF gradient
         (points from the query point to the closest point), and the surface normal at the closest point
         """
-
+        
         return SDFQuery(*self._do_object_frame_closest_point(points_in_object_frame, compute_normal=compute_normal))
 
 
