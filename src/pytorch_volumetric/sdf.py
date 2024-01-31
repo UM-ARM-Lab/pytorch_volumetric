@@ -441,7 +441,7 @@ class CylinderSDF(ObjectFrameSDF):
     """
     Cylinder SDF
 
-    Cylinder is defined as a cylinder with radius r and length l along the y-axis
+    Cylinder is defined as a cylinder with radius r and length l along the z-axis
 
     """
 
@@ -456,13 +456,13 @@ class CylinderSDF(ObjectFrameSDF):
                              [self.r + padding, self.l + padding, self.r + padding]])
 
     def _get_sdf(self, points_in_object_frame):
-        rounded_rad = 1e-3
+        rounded_rad = 1e-6
 
-        p_xz = points_in_object_frame[..., (0, 2)]
-        p_y = points_in_object_frame[..., 1]
+        p_xy = points_in_object_frame[..., :2]
+        p_y = points_in_object_frame[..., 2]
 
-        diff = torch.zeros_like(p_xz)
-        diff[..., 0] = torch.linalg.norm(p_xz, dim=-1) - self.r + rounded_rad
+        diff = torch.zeros_like(p_xy)
+        diff[..., 0] = torch.linalg.norm(p_xy, dim=-1) - self.r + rounded_rad
         diff[..., 1] = torch.abs(p_y) - self.l
 
         sdf_value = torch.clamp(torch.max(diff, dim=-1).values, max=0)
@@ -522,14 +522,7 @@ class CylinderSDF(ObjectFrameSDF):
     def get_mesh_list(self):
         # the open3d cylinder primitive is defined as a cylinder with radius r and length l along the z-axis
         # so we need to rotate it
-        mesh = o3d.geometry.TriangleMesh.create_cylinder(radius=self.r, height=2 * self.l)
-        R = np.array([
-            [1, 0, 0],
-            [0, 0, 1],
-            [0, 1, 0]
-        ])
-        mesh.rotate(R, center=[0, 0, 0])
-        return [mesh]
+        return [o3d.geometry.TriangleMesh.create_cylinder(radius=self.r, height=2 * self.l)]
 
     def sample_surface_points(self, num_points, device='cpu', **kwargs):
         # because our object is so straightforward we should be able to use a single gradient step on the sdf
