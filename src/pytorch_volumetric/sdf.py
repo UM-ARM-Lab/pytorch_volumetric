@@ -540,9 +540,10 @@ class CylinderSDF(ObjectFrameSDF):
 
 class SphereSDF(ObjectFrameSDF):
 
-    def __init__(self, radius, vis=None):
+    def __init__(self, radius, vis=None, device='cpu'):
         self.radius = radius
         self.vis = vis
+        self.device = device
 
     def surface_bounding_box(self, padding=0.):
         return torch.tensor([[-self.radius - padding, self.radius + padding],
