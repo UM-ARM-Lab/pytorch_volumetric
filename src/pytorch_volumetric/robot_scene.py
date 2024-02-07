@@ -327,8 +327,16 @@ class RobotScene:
             sdf_grad_world_frame = self.scene_transform.inverse().transform_normals(
                 sdf_weighted_grad.reshape(-1, 3)).reshape(B, self.grad_smooth_points, 3)
 
-            # compute gradient of closest point on object
-            closest_pts_grad = grad_h @ sdf_weighted_grad
+
+            # sdf gradients in world frame
+            closest_sdf_grads_world = self.scene_transform.inverse().transform_normals(
+                closest_sdf_grads.reshape(-1, 3)).reshape(B, self.grad_smooth_points, 3)
+
+            # Compute gradient of closest point with respect to robot points in world frame
+            dh_dx = grad_h.unsqueeze(-1) * closest_sdf_grads_world.unsqueeze(-2)
+            dclosest_dx = dh_dx.permute(0, 3, 1, 2) @ closest_pts_world.permute(0, 2, 1).unsqueeze(-1)
+            dclosest_dx = h[:, :, None] + dclosest_dx.permute(0, 2, 1, 3).squeeze(-1)
+            closest_pts_grad = dclosest_dx
 
             # this closest point grad is B x N x 3
             # it should be B x 3 x N x 3 ->
