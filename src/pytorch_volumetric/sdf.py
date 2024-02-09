@@ -613,6 +613,7 @@ def sample_mesh_points(obj_factory: ObjectFactory = None, num_points=100, seed=0
 
     with rand.SavedRNG():
         rand.seed(seed)
+        o3d.utility.random.seed(seed)
 
         # because the point sampling is not dispersed, we do the dispersion ourselves
         # we accomplish this by sampling more points than we need then randomly selecting a subset
