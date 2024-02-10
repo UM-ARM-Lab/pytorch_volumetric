@@ -455,49 +455,112 @@ class CylinderSDF(ObjectFrameSDF):
         return torch.tensor([[-self.r - padding, -self.l - padding, -self.r - padding],
                              [self.r + padding, self.l + padding, self.r + padding]])
 
-    def _get_sdf(self, points_in_object_frame):
-        rounded_rad = 1e-6
+    def _project_to_cylinder(self, points_in_object_frame):
 
         p_xy = points_in_object_frame[..., :2]
-        p_y = points_in_object_frame[..., 2]
+        p_z = points_in_object_frame[..., 2]
 
-        diff = torch.zeros_like(p_xy)
-        diff[..., 0] = torch.linalg.norm(p_xy, dim=-1) - self.r + rounded_rad
-        diff[..., 1] = torch.abs(p_y) - self.l
+        # determine which octant we are in
+        # first compute which octant we are in
+        octant = torch.sign(points_in_object_frame)
+        # absolute value z for now
+        p_z_abs = torch.abs(p_z)
 
-        sdf_value = torch.clamp(torch.max(diff, dim=-1).values, max=0)
-        sdf_value = sdf_value + torch.linalg.norm(torch.clamp(diff, min=0), dim=-1) - rounded_rad
-        return sdf_value
+        # project to disc
+        new_z = torch.clamp(p_z_abs, min=None, max=self.l)
 
-    def _get_sdf_grad(self, points_in_object_frame):
+        d_to_xy = torch.linalg.norm(p_xy, dim=-1)
+        d_to_disc = p_z_abs - self.l  # for negative components
+
+        # points outside the cylinder projected to cylinder
+        new_xy = p_xy / d_to_xy.unsqueeze(-1) * self.r
+
+        # points inside the cylinder projected to cylinder
+        d_to_xy = d_to_xy.unsqueeze(-1)
+        d_to_disc = d_to_disc.unsqueeze(-1)
+        new_xy = torch.where(d_to_xy < self.r,
+                             torch.where(d_to_disc > 0, p_xy,
+                                         torch.where(self.r - d_to_xy > torch.abs(d_to_disc), p_xy, new_xy)), new_xy)
+
+        in_flag = torch.where(d_to_xy > self.r, 1, -1)
+        in_flag = torch.where(d_to_disc > 0, 1, in_flag)
+
+        d_to_xy = d_to_xy.squeeze(-1)
+        d_to_disc = d_to_disc.squeeze(-1)
+        new_z = torch.where(d_to_xy < self.r,
+                            torch.where(d_to_disc > 0, self.l,
+                                        torch.where(self.r - d_to_xy > torch.abs(d_to_disc), self.l, new_z)), new_z)
+
+        # get sign for z component
+        new_z = new_z * octant[..., 2]
+
+        new_points = torch.cat((new_xy, new_z.unsqueeze(-1)), dim=-1)
+        grad = (new_points - points_in_object_frame)
+        sdf_val = in_flag * torch.linalg.norm(grad, dim=-1, keepdim=True)
+
+        # if we are very close to the surface, should use surface normal instead
+        # need to first figure out if we are on the disc or if we are on the side
+        z_vector = torch.tensor([0., 0., 1.], device=self.device).expand_as(points_in_object_frame)
+        xy_vector = torch.cat((p_xy / d_to_xy.unsqueeze(-1), torch.zeros(*p_xy.shape[:-1], 1,
+                                                                         device=self.device)), dim=-1)
+        z_vector = z_vector * octant[..., 2, None]
+        grad = torch.where(sdf_val.abs() < 1e-6,
+                           torch.where((d_to_disc.unsqueeze(-1)).abs() < 1e-6, z_vector, xy_vector), -grad / sdf_val)
+        return sdf_val.squeeze(-1), grad
+
+    def _get_sdf_hess(self, points_in_object_frame):
         # TODO: it is probably possible to do this analytically, use finite differencing for now
-        h = 1e-4
-        N = len(points_in_object_frame) - 1
+        # alternative grad method
+
+        h = 1e-6
+        N = len(points_in_object_frame.shape) - 1
         perturbation = h * torch.stack([torch.eye(3, device=self.device),
                                         -torch.eye(3, device=self.device)], dim=1).reshape(-1, 3)
 
         expand = [1] * N
         # perturb the points
         pts_perturbed = points_in_object_frame[..., None, :] + perturbation.reshape(*expand, -1, 3)
-        pts_perturbed = pts_perturbed.reshape(-1, 3, 2, 3).permute(0, 2, 3, 1)
+        pts_perturbed = pts_perturbed.reshape(-1, 3, 2, 3).permute(0, 2, 1, 3)
+        _, sdf_grads = self._project_to_cylinder(pts_perturbed.reshape(-1, 3))  # .reshape(-1, 2, 3)
+        sdf_grads = sdf_grads.reshape(-1, 2, 3, 3)
+        hess = (sdf_grads[:, 0] - sdf_grads[:, 1]) / (2 * h)
 
-        sdf_vals = self._get_sdf(pts_perturbed.reshape(-1, 3)).reshape(-1, 2, 3)
-        grad = (sdf_vals[:, 0, :] - sdf_vals[:, 1, :]) / (2 * h)
-        norm_grad = torch.linalg.norm(grad, dim=-1, keepdim=True)
-        # normalize
-        grad = torch.where(norm_grad > 1e-4, grad / norm_grad, torch.zeros_like(grad))
-        return grad
+        # hess should be symmetric
+        hess = (hess + hess.permute(0, 2, 1)) / 2
+
+        # # try a test
+        # hess2 = torch.zeros_like(hess)
+        # for i in range(3):
+        #     d = torch.zeros_like(points_in_object_frame)
+        #     d[..., i] = h
+        #     print(d[0])
+        #
+        #     _, sdf_grads_plus = self._project_to_cylinder(points_in_object_frame + d)
+        #     _, sdf_grads_minus = self._project_to_cylinder(points_in_object_frame - d)
+        #
+        #     print(sdf_grads_minus.shape, sdf_grads_plus.shape, hess2[..., i].shape)
+        #     hess2[..., i] = (sdf_grads_plus - sdf_grads_minus).reshape(-1, 3) / (2 * h)
+        #
+        # print(hess)
+        # print(hess2)
+        # print(torch.max(torch.abs(hess - hess2)))
+        # print(torch.max(hess.abs()))
+        # print(torch.min(hess2.abs()))
+        # exit(0)
+        return hess
 
     def __call__(self, points_in_object_frame, return_extra_info=False):
         N, d = points_in_object_frame.shape[-2:]
 
-        sdf_value = self._get_sdf(points_in_object_frame)
-        sdf_grad = self._get_sdf_grad(points_in_object_frame)
+        # sdf_value = self._get_sdf(points_in_object_frame)
+        # sdf_grad = self._get_sdf_grad(points_in_object_frame)
+        sdf_value, sdf_grad = self._project_to_cylinder(points_in_object_frame)
 
+        sdf_hess = self._get_sdf_hess(points_in_object_frame)
         # TODO: Including radius of corners results in a non-zero hessian around corners, perhaps compute that?
         sdf_value = sdf_value.reshape(*points_in_object_frame.shape[:-1])
         sdf_grad = sdf_grad.reshape(*points_in_object_frame.shape[:-1], d)
-        sdf_hess = torch.zeros(*points_in_object_frame.shape[:-1], d, d, device=points_in_object_frame.device)
+        sdf_hess = sdf_hess.reshape(*points_in_object_frame.shape[:-1], d, d)
 
         # points are transformed to link frame, thus it needs to compare against the object in link frame
         # objId is not in link frame and shouldn't be moved
@@ -711,13 +774,11 @@ class ComposedSDF(ObjectFrameSDF):
             v = sdf_result['sdf_val']
             g = sdf_result['sdf_grad']
             h = sdf_result['sdf_hess']
-
             # need to transform the gradient back to the object frame
             g = self.link_frame_to_obj_frame[i].transform_normals(g)
 
             # transform the hessian also
             h = self.link_frame_to_obj_frame[i].transform_shape_operator(h)
-
             sdfv.append(v)
             sdfg.append(g)
             sdfh.append(h)
