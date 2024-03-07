@@ -9,6 +9,7 @@ from pytorch_kinematics.transforms.rotation_conversions import euler_angles_to_m
 
 from torch.func import jacrev, jacfwd, hessian, vmap
 from functools import partial
+import open3d as o3d
 
 
 class RobotScene:
@@ -86,8 +87,7 @@ class RobotScene:
         mask = torch.where(sdf_vals < -self.threshold, torch.zeros_like(sdf_vals), torch.ones_like(sdf_vals))
         return query_points, mask
 
-    def visualize_robot(self, q: torch.Tensor, env_q: torch.Tensor = None):
-        import open3d as o3d
+    def get_visualization_meshes(self, q: torch.Tensor, env_q: torch.Tensor = None):
         pcd = o3d.geometry.PointCloud()
         self.robot_sdf.set_joint_configuration(q)
         if env_q is not None:
@@ -107,8 +107,11 @@ class RobotScene:
         for scene_mesh, c in zip(scene_meshes, colors):
             scene_mesh.paint_uniform_color(c)
         # scene_mesh = self.scene_sdf.obj_factory._mesh.transform(self.scene_transform.get_matrix()[0].cpu().numpy())
-        o3d.visualization.draw_geometries(pv.get_transformed_meshes(self.robot_sdf) + [pcd] + scene_meshes,
-                                          mesh_show_wireframe=True)
+        return pv.get_transformed_meshes(self.robot_sdf) + [pcd] + scene_meshes
+
+    def visualize_robot(self, q: torch.Tensor, env_q: torch.Tensor = None):
+        meshes = self.get_visualization_meshes(q, env_q)
+        o3d.visualization.draw_geometries(meshes, mesh_show_wireframe=True)
 
     def _transform_to_world(self, q: torch.Tensor, weight=None):
         """

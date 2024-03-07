@@ -95,7 +95,8 @@ def get_transformed_meshes(robot_sdf: model_to_sdf.RobotSDF, obj_to_world_tsf=No
     tsfs = tsfs.get_matrix()
     for i in range(len(robot_sdf.sdf_to_link_name)):
         # assuming they are individually MeshSDFs
-        mesh = copy.deepcopy(robot_sdf.sdf.sdfs[i].obj_factory._mesh)
+        mesh = copy.deepcopy(robot_sdf.sdf.sdfs[i].get_mesh_list()[0])
         mesh = mesh.transform(tsfs[i].cpu().numpy())
         meshes.append(mesh)
     return meshes
+
