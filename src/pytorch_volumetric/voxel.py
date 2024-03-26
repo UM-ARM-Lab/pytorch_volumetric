@@ -117,6 +117,11 @@ class VoxelSet(Voxels):
         return self.positions, self.values
 
 
+def bounds_contain_another_bounds(outer_bounds: np.array, inner_bounds: np.array):
+    """Return whether outer_bounds contains inner_bounds"""
+    return np.all(outer_bounds[:, 0] <= inner_bounds[:, 0]) and np.all(outer_bounds[:, 1] >= inner_bounds[:, 1])
+
+
 def voxel_down_sample(points, resolution, range_per_dim=None, ignore_flat_dim=False):
     """
     Down sample point clouds to the center of a voxel grid with a given resolution.
@@ -128,9 +133,11 @@ def voxel_down_sample(points, resolution, range_per_dim=None, ignore_flat_dim=Fa
     smaller range than the range the points to ignore outliers)
     :return:
     """
-    if range_per_dim is None:
-        range_per_dim = np.stack(
-            (points.min(dim=0)[0].cpu().numpy(), points.max(dim=0)[0].cpu().numpy())).T
+    if points.shape[0] == 0:
+        return points
+    data_bounds = np.stack((points.min(dim=0)[0].cpu().numpy(), points.max(dim=0)[0].cpu().numpy())).T
+    if range_per_dim is None or bounds_contain_another_bounds(range_per_dim, data_bounds):
+        range_per_dim = data_bounds
 
     # special case for flat dimensions; assumes only last dimension can be flat
     flat_z = ignore_flat_dim and range_per_dim[-1][0] == range_per_dim[-1][1]
@@ -147,3 +154,4 @@ def voxel_down_sample(points, resolution, range_per_dim=None, ignore_flat_dim=Fa
     if flat_z:
         pts = torch.cat((pts, torch.ones((pts.shape[0], 1), device=device) * flat_z_val), dim=-1)
     return pts
+
