@@ -298,10 +298,14 @@ class RobotScene:
             grad_h = -self.softmin_temp * (torch.diag_embed(h) * eye - h.unsqueeze(-1) * h.unsqueeze(-2))
 
             # want the closest points in the link frame
-            closest_pts = self.robot_query_points.repeat(B, 1, 1, 1).reshape(B, -1, 3)[
+            closest_pts_link = self.robot_query_points.repeat(B, 1, 1, 1).reshape(B, -1, 3)[
                 B_range, closest_indices].reshape(-1, 3)
+
             # closest points in world frame
             closest_pts_world = pts_world.reshape(B, -1, 3)[B_range, closest_indices]
+
+            # closest points in scene frame
+            closest_pts_scene = pts.reshape(B, -1, 3)[B_range, closest_indices].reshape(-1, 3)
 
             closest_links = self.desired_frame_idx[closest_indices // self.points_per_link].reshape(-1)
             q_repeat = q.unsqueeze(1).repeat(1, self.grad_smooth_points, 1).reshape(B * self.grad_smooth_points, -1)
@@ -309,22 +313,16 @@ class RobotScene:
                                                                                             -1)
             closest_env_links = sdf_frame_indices[B_range, closest_indices].reshape(-1)
 
-            # if not compute_hessian:
-            #    rob_jacobian = self.robot_sdf.chain.jacobian(q_repeat,
-            #                                                 locations=closest_pts,
-            #                                                 link_indices=closest_links)
-            #    env_jacobian = self.scene_sdf.chain.jacobian(env_q_repeat,
-            #                                                 locations=closest_pts,
-            #                                                 link_indices=closest_env_links)
-            # else:
             # now need hessian always
             rob_jacobian, rob_hessian = self.robot_sdf.chain.jacobian_and_hessian(q_repeat,
-                                                                                  locations=closest_pts,
+                                                                                  locations=closest_pts_link,
                                                                                   link_indices=closest_links)
 
+            # want closest
             env_jacobian, env_hessian = self.scene_sdf.chain.jacobian_and_hessian(env_q_repeat,
-                                                                                  locations=closest_pts,
-                                                                                  link_indices=closest_env_links)
+                                                                                  locations=closest_pts_scene,
+                                                                                  link_indices=closest_env_links,
+                                                                                  locations_in_ee_frame=False)
             # rotation jacobian for environment
             env_rot_jacobian = env_jacobian[:, 3:].reshape(B, self.grad_smooth_points, 3, -1)
 
