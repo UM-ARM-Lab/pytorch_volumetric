@@ -68,6 +68,7 @@ def draw_sdf_slice(s: sdf.ObjectFrameSDF, query_range, resolution=0.01, interior
                sdf_grad_uv[::subsample_n, ::subsample_n, shown_dims[0]],
                sdf_grad_uv[::subsample_n, ::subsample_n, shown_dims[1]], color='g')
     ax.clabel(cset2, cset2.levels, inline=True, fontsize=13, fmt=fmt)
+    plt.colorbar(cset1)
     # fig = plt.gcf()
     # fig.canvas.draw()
     plt.draw()
