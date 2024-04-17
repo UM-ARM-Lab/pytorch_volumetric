@@ -45,7 +45,9 @@ class RobotSDF(sdf.ObjectFrameSDF):
             for link_vis in frame.link.visuals:
                 if link_vis.geom_type == "mesh":
                     logger.info(f"{frame.link.name} offset {link_vis.offset}")
-                    link_obj = sdf.MeshObjectFactory(link_vis.geom_param, path_prefix=path_prefix)
+                    link_obj = sdf.MeshObjectFactory(link_vis.geom_param[0],
+                                                     scale=link_vis.geom_param[1],
+                                                     path_prefix=path_prefix)
                     link_sdf = link_sdf_cls(link_obj)
                     self.sdf_to_link_name.append(frame.link.name)
                     sdfs.append(link_sdf)
@@ -57,8 +59,8 @@ class RobotSDF(sdf.ObjectFrameSDF):
         self.sdf = sdf.ComposedSDF(sdfs, self.object_to_link_frames)
         self.set_joint_configuration(default_joint_config)
 
-    def surface_bounding_box(self, padding=0.):
-        return self.sdf.surface_bounding_box(padding=padding)
+    def surface_bounding_box(self, **kwargs):
+        return self.sdf.surface_bounding_box(**kwargs)
 
     def link_bounding_boxes(self):
         """
@@ -99,10 +101,16 @@ class RobotSDF(sdf.ObjectFrameSDF):
         for link_name in self.sdf_to_link_name:
             tsfs.append(tf[link_name].get_matrix())
         # make offset transforms have compatible batch dimensions
-        offset_tsf = self.offset_transforms
+        offset_tsf = self.offset_transforms.inverse()
         if self.configuration_batch is not None:
-            offset_tsf = pk.Transform3d(matrix=offset_tsf.get_matrix().repeat(*self.configuration_batch, 1, 1))
-        self.object_to_link_frames = pk.Transform3d(matrix=torch.cat(tsfs).inverse()).compose(offset_tsf)
+            # must be of shape (num_links, *self.configuration_batch, 4, 4) before flattening
+            expand_dims = (None,) * len(self.configuration_batch)
+            offset_tsf_mat = offset_tsf.get_matrix()[(slice(None),) + expand_dims]
+            offset_tsf_mat = offset_tsf_mat.repeat(1, *self.configuration_batch, 1, 1)
+            offset_tsf = pk.Transform3d(matrix=offset_tsf_mat.reshape(-1, 4, 4))
+
+        tsfs = torch.cat(tsfs)
+        self.object_to_link_frames = offset_tsf.compose(pk.Transform3d(matrix=tsfs).inverse())
         if self.sdf is not None:
             self.sdf.set_transforms(self.object_to_link_frames, batch_dim=self.configuration_batch)
 
@@ -125,19 +133,39 @@ def cache_link_sdf_factory(resolution=0.01, padding=0.1, **kwargs):
     return create_sdf
 
 
-def aabb_to_ordered_end_points(aabb):
+def aabb_to_ordered_end_points(aabb, arrange_in_sequential_order=False):
     aabbMin = aabb[:, 0]
     aabbMax = aabb[:, 1]
-    arr = [
-        [aabbMin[0], aabbMin[1], aabbMin[2]],
-        [aabbMax[0], aabbMin[1], aabbMin[2]],
-        [aabbMin[0], aabbMax[1], aabbMin[2]],
-        [aabbMin[0], aabbMin[1], aabbMax[2]],
-        [aabbMin[0], aabbMax[1], aabbMax[2]],
-        [aabbMax[0], aabbMin[1], aabbMax[2]],
-        [aabbMax[0], aabbMax[1], aabbMin[2]],
-        [aabbMax[0], aabbMax[1], aabbMax[2]]
-    ]
+    if arrange_in_sequential_order:
+        arr = [
+            [aabbMin[0], aabbMin[1], aabbMin[2]],
+            [aabbMax[0], aabbMin[1], aabbMin[2]],
+            [aabbMax[0], aabbMax[1], aabbMin[2]],
+            [aabbMin[0], aabbMax[1], aabbMin[2]],
+            [aabbMin[0], aabbMin[1], aabbMin[2]],
+            [aabbMin[0], aabbMin[1], aabbMax[2]],
+            [aabbMax[0], aabbMin[1], aabbMax[2]],
+            [aabbMax[0], aabbMin[1], aabbMin[2]],
+            [aabbMax[0], aabbMin[1], aabbMax[2]],
+            [aabbMax[0], aabbMax[1], aabbMax[2]],
+            [aabbMax[0], aabbMax[1], aabbMin[2]],
+            [aabbMax[0], aabbMax[1], aabbMax[2]],
+            [aabbMin[0], aabbMax[1], aabbMax[2]],
+            [aabbMin[0], aabbMax[1], aabbMin[2]],
+            [aabbMin[0], aabbMax[1], aabbMax[2]],
+            [aabbMin[0], aabbMin[1], aabbMax[2]],
+        ]
+    else:
+        arr = [
+            [aabbMin[0], aabbMin[1], aabbMin[2]],
+            [aabbMax[0], aabbMin[1], aabbMin[2]],
+            [aabbMin[0], aabbMax[1], aabbMin[2]],
+            [aabbMin[0], aabbMin[1], aabbMax[2]],
+            [aabbMin[0], aabbMax[1], aabbMax[2]],
+            [aabbMax[0], aabbMin[1], aabbMax[2]],
+            [aabbMax[0], aabbMax[1], aabbMin[2]],
+            [aabbMax[0], aabbMax[1], aabbMax[2]]
+        ]
     if torch.is_tensor(aabb):
         return torch.tensor(arr, device=aabb.device, dtype=aabb.dtype)
     return np.array(arr)

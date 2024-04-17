@@ -1,4 +1,5 @@
 import abc
+import enum
 import math
 import os
 import typing
@@ -10,6 +11,7 @@ import open3d as o3d
 import torch
 from arm_pytorch_utilities import tensor_utils, rand
 from multidim_indexing import torch_view
+from functools import partial
 
 from pytorch_volumetric.voxel import VoxelGrid, get_divisible_range_by_resolution, get_coordinates_and_points_in_grid
 import pytorch_kinematics as pk
@@ -29,7 +31,7 @@ class ObjectFactory(abc.ABC):
     def __init__(self, name='', scale=1.0, vis_frame_pos=(0, 0, 0), vis_frame_rot=(0, 0, 0, 1),
                  plausible_suboptimality=0.001, mesh=None, **kwargs):
         self.name = name
-        self.scale = scale
+        self.scale = scale if scale is not None else 1.0
         # frame from model's base frame to the simulation's use of the model
         self.vis_frame_pos = vis_frame_pos
         self.vis_frame_rot = vis_frame_rot
@@ -42,6 +44,12 @@ class ObjectFactory(abc.ABC):
         self._raycasting_scene = None
         self._face_normals = None
         self.precompute_sdf()
+
+    def __reduce__(self):
+        return partial(self.__class__, scale=self.scale, vis_frame_pos=self.vis_frame_pos,
+                       vis_frame_rot=self.vis_frame_rot,
+                       plausible_suboptimality=self.plausible_suboptimality, **self.other_load_kwargs), \
+            (self.name,)
 
     @abc.abstractmethod
     def make_collision_obj(self, z, rgba=None):
@@ -61,24 +69,37 @@ class ObjectFactory(abc.ABC):
                             object_id=object_id, vis_frame_pos=frame_pos, vis_frame_rot=self.vis_frame_rot)
 
     def bounding_box(self, padding=0.):
-
         aabb = self._mesh.get_axis_aligned_bounding_box()
         world_min = aabb.get_min_bound()
         world_max = aabb.get_max_bound()
         # already scaled, but we add a little padding
         ranges = np.array(list(zip(world_min, world_max)))
-        ranges[:, 0] -= padding
-        ranges[:, 1] += padding
+        extents = ranges[:, 1] - ranges[:, 0]
+        ranges[:, 0] -= padding + padding_ratio * extents
+        ranges[:, 1] += padding + padding_ratio * extents
         return ranges
 
-    def precompute_sdf(self):
-        # scale mesh the approrpiate amount
+    def center(self):
+        """Get center of mass assuming uniform density. Return is in object frame"""
         if self._mesh is None:
-            full_path = self.get_mesh_high_poly_resource_filename()
-            if not os.path.exists(full_path):
-                raise RuntimeError(f"Expected mesh file does not exist: {full_path}")
-            self._mesh = o3d.io.read_triangle_mesh(full_path)
-        self._mesh = self._mesh.scale(self.scale, center=[0, 0, 0])
+            self.precompute_sdf()
+        return self._mesh.get_center()
+
+    def precompute_sdf(self):
+        if self._mesh is not None:
+            return
+        # scale mesh the approrpiate amount
+
+        full_path = self.get_mesh_high_poly_resource_filename()
+        full_path = os.path.expanduser(full_path)
+        if not os.path.exists(full_path):
+            raise RuntimeError(f"Expected mesh file does not exist: {full_path}")
+        self._mesh = o3d.io.read_triangle_mesh(full_path)
+        # scale mesh
+        scale_transform = np.eye(4)
+        np.fill_diagonal(scale_transform[:3, :3], self.scale)
+        self._mesh.transform(scale_transform)
+            
         # convert from mesh object frame to simulator object frame
         x, y, z, w = self.vis_frame_rot
         self._mesh = self._mesh.rotate(o3d.geometry.get_rotation_matrix_from_quaternion((w, x, y, z)),
@@ -91,7 +112,7 @@ class ObjectFactory(abc.ABC):
         self._mesh.compute_triangle_normals()
         self._face_normals = np.asarray(self._mesh.triangle_normals)
 
-    @tensor_utils.handle_batch_input
+    @tensor_utils.handle_batch_input(n=2)
     def _do_object_frame_closest_point(self, points_in_object_frame, compute_normal=False):
 
         if torch.is_tensor(points_in_object_frame):
@@ -113,14 +134,20 @@ class ObjectFactory(abc.ABC):
         distance = np.linalg.norm(gradient, axis=-1)
         # normalize gradients
         has_direction = distance > 0
-        gradient[has_direction] /= distance[has_direction, None]
+        gradient[has_direction] = gradient[has_direction] / distance[has_direction, None]
 
-        rays = np.concatenate([points_in_object_frame, np.ones_like(points_in_object_frame)], axis=-1)
+        # ensure ray destination is outside the object
+        ray_destination = np.repeat(self.bounding_box(padding=1.0)[None, :, 1], points_in_object_frame.shape[0], axis=0)
+        # add noise to ray destination, this helps reduce artifacts in the sdf
+        ray_destination = ray_destination + 1e-4 * np.random.randn(*points_in_object_frame.shape)
+        ray_destination = ray_destination.astype(np.float32)
+        # check if point is inside the object
+        rays = np.concatenate([points_in_object_frame, ray_destination], axis=-1)
         intersection_counts = self._raycasting_scene.count_intersections(rays).numpy()
         is_inside = intersection_counts % 2 == 1
-        distance[is_inside] *= -1
+        distance[is_inside] = distance[is_inside] * -1
         # fix gradient direction to point away from surface outside
-        gradient[~is_inside] *= -1
+        gradient[~is_inside] = gradient[~is_inside] * -1
 
         # for any points very close to the surface, it is better to use the surface normal as the gradient
         # this is because the closest point on the surface may be noisy when close by
@@ -164,6 +191,12 @@ class MeshObjectFactory(ObjectFactory):
         # specify ranges=None to infer the range from the object's bounding box
         super(MeshObjectFactory, self).__init__(mesh_name, **kwargs)
 
+    def __reduce__(self):
+        return partial(self.__class__, path_prefix=self.path_prefix, scale=self.scale, vis_frame_pos=self.vis_frame_pos,
+                       vis_frame_rot=self.vis_frame_rot,
+                       plausible_suboptimality=self.plausible_suboptimality, **self.other_load_kwargs), \
+            (self.name,)
+
     def make_collision_obj(self, z, rgba=None):
         return None, None
 
@@ -185,10 +218,11 @@ class ObjectFrameSDF(abc.ABC):
         """
 
     @abc.abstractmethod
-    def surface_bounding_box(self, padding=0.):
+    def surface_bounding_box(self, padding=0., padding_ratio=0.):
         """
         Get the bounding box for the 0-level set in the form of a sequence of (min,max) coordinates
         :param padding: amount to inflate the min and max from the actual bounding box
+        :param padding_ratio: ratio of the extent of that dimension to use for padding; added on top of absolute padding
         :return: (min,max) for each dimension
         """
 
@@ -248,8 +282,8 @@ class MeshSDF(ObjectFrameSDF):
         self.obj_factory = obj_factory
         self.vis = vis
 
-    def surface_bounding_box(self, padding=0.):
-        return torch.tensor(self.obj_factory.bounding_box(padding))
+    def surface_bounding_box(self, **kwargs):
+        return torch.tensor(self.obj_factory.bounding_box(**kwargs))
 
     def __call__(self, points_in_object_frame):
         N, d = points_in_object_frame.shape[-2:]
@@ -286,11 +320,11 @@ class ComposedSDF(ObjectFrameSDF):
         self.tsf_batch = None
         self.set_transforms(obj_frame_to_each_frame)
 
-    def surface_bounding_box(self, padding=0.):
+    def surface_bounding_box(self, **kwargs):
         bounds = []
         tsf = self.obj_frame_to_link_frame.inverse()
         for i, sdf in enumerate(self.sdfs):
-            pts = sdf.surface_bounding_box(padding=padding)
+            pts = sdf.surface_bounding_box(**kwargs)
             pts = tsf[self.ith_transform_slice(i)].transform_points(
                 pts.to(dtype=tsf.dtype, device=tsf.device).transpose(0, 1))
             # edge case where the batch is a single element
@@ -375,10 +409,17 @@ class ComposedSDF(ObjectFrameSDF):
         return vv, gg
 
 
+class OutOfBoundsStrategy(enum.Enum):
+    LOOKUP_GT_SDF = 0
+    BOUNDING_BOX = 1  # will also always under-approximate the SDF value, but more accurate than sphere approximation
+
+
 class CachedSDF(ObjectFrameSDF):
     """SDF via looking up precomputed voxel grids requiring a ground truth SDF to default to on uncached queries."""
 
-    def __init__(self, object_name, resolution, range_per_dim, gt_sdf: ObjectFrameSDF, device="cpu", clean_cache=False,
+    def __init__(self, object_name, resolution, range_per_dim, gt_sdf: ObjectFrameSDF,
+                 out_of_bounds_strategy=OutOfBoundsStrategy.BOUNDING_BOX,
+                 device="cpu", clean_cache=False,
                  debug_check_sdf=False, cache_path="sdf_cache.pkl"):
         """
 
@@ -386,6 +427,9 @@ class CachedSDF(ObjectFrameSDF):
         :param resolution: side length of each voxel cell
         :param range_per_dim: (min, max) sequence for each dimension (e.g. 3 for 3D)
         :param gt_sdf: ground truth SDF used to generate the cache and default to on queries outside of the cache
+        :param out_of_bounds_strategy: what to do when a query is outside the cached range.
+        LOOKUP_GT_SDF: use the ground truth SDF for the value and gradient (relatively expensive)
+        BOUNDING_BOX: use the distance to the bounding box (under-approximates the SDF value)
         :param device: pytorch compatible device
         :param clean_cache: whether to ignore the existing cache and force recomputation
         :param debug_check_sdf: check that the generated SDF matches the ground truth SDF
@@ -396,6 +440,7 @@ class CachedSDF(ObjectFrameSDF):
         self.voxels = None
         # voxel grid can't handle vector values yet
         self.voxels_grad = None
+        self.out_of_bounds_strategy = out_of_bounds_strategy
 
         cached_underlying_sdf = None
         cached_underlying_sdf_grad = None
@@ -447,8 +492,10 @@ class CachedSDF(ObjectFrameSDF):
                                                    invalid_value=self._fallback_sdf_value_func)
         self.voxels_grad = cached_underlying_sdf_grad.squeeze()
 
-    def surface_bounding_box(self, padding=0.):
-        return self.gt_sdf.surface_bounding_box(padding)
+        self.bb = self.surface_bounding_box().to(device=device)
+
+    def surface_bounding_box(self, **kwargs):
+        return self.gt_sdf.surface_bounding_box(**kwargs)
 
     def _fallback_sdf_value_func(self, *args, **kwargs):
         sdf_val, _ = self.gt_sdf(*args, **kwargs)
@@ -463,13 +510,46 @@ class CachedSDF(ObjectFrameSDF):
         inbound_keys = self.voxels.get_valid_values(points_in_object_frame)
         out_of_bound_keys = ~inbound_keys
 
+        # logger.info(f"out of bound keys: {out_of_bound_keys.sum()}/{out_of_bound_keys.numel()}")
+
         dtype = points_in_object_frame.dtype
         val = torch.zeros(keys_ravelled.shape, device=self.device, dtype=dtype)
         grad = torch.zeros(keys.shape, device=self.device, dtype=dtype)
 
         val[inbound_keys] = self.voxels.raw_data[keys_ravelled[inbound_keys]]
         grad[inbound_keys] = self.voxels_grad[keys_ravelled[inbound_keys]]
-        val[out_of_bound_keys], grad[out_of_bound_keys] = self.gt_sdf(points_in_object_frame[out_of_bound_keys])
+
+        points_oob = points_in_object_frame[out_of_bound_keys]
+        if self.out_of_bounds_strategy == OutOfBoundsStrategy.LOOKUP_GT_SDF:
+            val[out_of_bound_keys], grad[out_of_bound_keys] = self.gt_sdf(points_oob)
+        elif self.out_of_bounds_strategy == OutOfBoundsStrategy.BOUNDING_BOX:
+            if self.bb.dtype != dtype:
+                self.bb = self.bb.to(dtype=dtype)
+            # distance to bounding box
+            dmin = self.bb[:, 0] - points_oob
+            dmin_active = dmin > 0
+            dmin[~dmin_active] = 0
+            dmax = points_oob - self.bb[:, 1]
+            dmax_active = dmax > 0
+            dmax[~dmax_active] = 0
+            dtotal = dmin + dmax
+            # convert to gradient; for dmin, the dtotal component should be negative; for dmax, positive
+            dtotal[dmin_active] = -dtotal[dmin_active]
+            dist = dtotal.norm(dim=-1)
+            # normalize gradient
+            grad[out_of_bound_keys] = dtotal / dist.unsqueeze(-1)
+            val[out_of_bound_keys] = dist
+
+            # comparison with ground truth
+            if self.debug_check_sdf:
+                val_gt, grad_gt = self.gt_sdf(points_oob)
+                diff = val_gt - val[out_of_bound_keys]
+                # always under-approximate the SDF value
+                assert torch.all(diff > 0)
+                # cosine similarity to compare the gradient vectors
+                diff_grad = torch.cosine_similarity(grad_gt, grad[out_of_bound_keys], dim=-1)
+                assert torch.all(diff_grad > 0.7)
+                assert diff_grad.mean() > 0.95
 
         if self.debug_check_sdf:
             val_gt = self._fallback_sdf_value_func(points_in_object_frame)
@@ -533,6 +613,7 @@ def sample_mesh_points(obj_factory: ObjectFactory = None, num_points=100, seed=0
 
     with rand.SavedRNG():
         rand.seed(seed)
+        o3d.utility.random.seed(seed)
 
         # because the point sampling is not dispersed, we do the dispersion ourselves
         # we accomplish this by sampling more points than we need then randomly selecting a subset

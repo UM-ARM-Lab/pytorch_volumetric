@@ -39,6 +39,33 @@ sdf = pv.MeshSDF(obj)
 cached_sdf = pv.CachedSDF('drill', resolution=0.01, range_per_dim=obj.bounding_box(padding=0.1), gt_sdf=sdf)
 ```
 
+By default, query points outside the cache will be compared against the object bounding box.
+To instead use the ground truth SDF, pass `out_of_bounds_strategy=pv.OutOfBoundsStrategy.LOOKUP_GT_SDF` to 
+the constructor.
+
+Note that the bounding box comparison will always under-approximate the SDF value, but empirically it is sufficient
+for most applications when querying out of bound points. It is **dramatically faster** than using the ground truth SDF.
+
+### Composed SDF
+Multiple SDFs can be composed together to form an SDF that is convenient to query. This may be because your scene
+is composed of multiple objects and you have them as separate meshes. Note: the objects should not be overlapping or
+share faces, otherwise there will be artifacts in the SDF query in determining interior-ness. 
+
+```python
+import pytorch_volumetric as pv
+import pytorch_kinematics as pk
+
+obj = pv.MeshObjectFactory("YcbPowerDrill/textured_simple_reoriented.obj")
+
+# 2 drills in the world
+sdf1 = pv.MeshSDF(obj)
+sdf2 = pv.MeshSDF(obj)
+# need to specify the transform of each SDF frame
+tsf1 = pk.Translate(0.1, 0, 0)
+tsf2 = pk.Translate(-0.2, 0, 0.2)
+sdf = pv.ComposedSDF([sdf1, sdf2], tsf1.stack(tsf2))
+```
+
 ### SDF value and gradient queries
 
 Suppose we have an `ObjectFrameSDF` (such as created from above)

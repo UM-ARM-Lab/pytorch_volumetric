@@ -9,7 +9,7 @@ from pytorch_volumetric.sdf import ObjectFactory, sample_mesh_points
 
 
 def batch_chamfer_dist(world_to_object: torch.tensor, model_points_world_frame_eval: torch.tensor,
-                       obj_factory: ObjectFactory, viewing_delay=0, scale=1000, print_err=False, vis=None):
+                       obj_factory: ObjectFactory, viewing_delay=0, scale=1000., print_err=False, vis=None):
     """
     Compute batched unidirectional chamfer distance between the observed world frame surface points and the
     surface points of the object transformed by a set of 4x4 rigid transform matrices (from the object frame).
@@ -43,7 +43,7 @@ def batch_chamfer_dist(world_to_object: torch.tensor, model_points_world_frame_e
             pos, rot = matrix_to_pos_rot(m[b])
             obj_factory.draw_mesh(vis, "chamfer evaluation", (pos, rot), rgba=(0, 0.1, 0.8, 0.1),
                                   object_id=vis.USE_DEFAULT_ID_FOR_NAME)
-            vis.draw_point("avgerr", [0, 0, 0], (1, 0, 0), label=f"avgerr: {round(errors_per_batch[b].item())}")
+            # vis.draw_point("avgerr", [0, 0, 0], (1, 0, 0), label=f"avgerr: {round(errors_per_batch[b].item())}")
 
             if print_err:
                 for i in range(eval_num_points):
@@ -83,7 +83,7 @@ class PlausibleDiversity:
                                                          name=obj_factory.name)
         self.model_points_eval = model_points_eval
 
-    def __call__(self, T_est_inv, T_p, bidirectional=False):
+    def __call__(self, T_est_inv, T_p, bidirectional=False, scale=1000.):
         """
         Compute the plausibility and coverage of an estimated set of transforms against a set of plausible transforms.
 
@@ -91,10 +91,10 @@ class PlausibleDiversity:
         :param T_p: The plausible transforms, in the form of Px4x4 homogeneous matrices.
         :return: plausibility score, coverage score, most_plausible_per_estimated, most_covered_per_plausible
         """
-        errors_per_batch = self.compute_tf_pairwise_error_per_batch(T_est_inv, T_p)
+        errors_per_batch = self.compute_tf_pairwise_error_per_batch(T_est_inv, T_p, scale=scale)
         ret = self.do_evaluate_plausible_diversity_on_pairwise_chamfer_dist(errors_per_batch)
         if bidirectional:
-            errors_per_batch_rev = self.compute_tf_pairwise_error_per_batch(T_p, T_est_inv)
+            errors_per_batch_rev = self.compute_tf_pairwise_error_per_batch(T_p, T_est_inv, scale=scale)
             ret2 = self.do_evaluate_plausible_diversity_on_pairwise_chamfer_dist(errors_per_batch_rev)
             # the plausibility and coverage are flipped when we reverse the transforms
             ret = PlausibleDiversityReturn(
@@ -105,7 +105,7 @@ class PlausibleDiversity:
             )
         return ret
 
-    def compute_tf_pairwise_error_per_batch(self, T_est_inv, T_p):
+    def compute_tf_pairwise_error_per_batch(self, T_est_inv, T_p, scale=1000.):
         # effectively can apply one transform then take the inverse using the other one; if they are the same, then
         # we should end up in the base frame if that T == Tp
         # want pairwise matrix multiplication |T| x |Tp| x 4 x 4 T[0]@Tp[0], T[0]@Tp[1]
@@ -116,7 +116,7 @@ class PlausibleDiversity:
         B, P = Iapprox.shape[:2]
         self.model_points_eval = self.model_points_eval.to(device=Iapprox.device, dtype=Iapprox.dtype)
         errors_per_batch = batch_chamfer_dist(Iapprox.reshape(B * P, 4, 4), self.model_points_eval,
-                                              self.obj_factory, viewing_delay=0, vis=None)
+                                              self.obj_factory, viewing_delay=0, vis=None, scale=scale)
         errors_per_batch = errors_per_batch.view(B, P)
         return errors_per_batch
 

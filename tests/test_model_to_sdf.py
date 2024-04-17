@@ -23,7 +23,7 @@ logging.basicConfig(level=logging.INFO, force=True,
 
 TEST_DIR = os.path.dirname(__file__)
 
-visualize = False
+visualize = True
 
 
 def test_urdf_to_sdf():
@@ -52,47 +52,48 @@ def test_urdf_to_sdf():
     plt.ion()
     plt.show()
 
-    ret = pv.draw_sdf_slice(s, query_range, resolution=0.01, device=s.device)
-    sdf_val = ret[0]
-    pts = ret[2]
+    if visualize:
+        ret = pv.draw_sdf_slice(s, query_range, resolution=0.01, device=s.device)
+        sdf_val = ret[0]
+        pts = ret[2]
 
-    surface = sdf_val.abs() < 0.005
+        surface = sdf_val.abs() < 0.005
 
-    if visualization == "pybullet":
-        # toggles - g:GUI w:wireframe j:joint axis a:AABB i:interrupt
-        p.connect(p.GUI)
-        p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0)
-        p.setAdditionalSearchPath(search_path)
-        armId = p.loadURDF(urdf, [0, 0, 0], useFixedBase=True)
-        # p.resetBasePositionAndOrientation(armId, [0, 0, 0], [0, 0, 0, 1])
-        for i, q in enumerate(th):
-            p.resetJointState(armId, i, q.item())
+        if visualization == "pybullet":
+            # toggles - g:GUI w:wireframe j:joint axis a:AABB i:interrupt
+            p.connect(p.GUI)
+            p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0)
+            p.setAdditionalSearchPath(search_path)
+            armId = p.loadURDF(urdf, [0, 0, 0], useFixedBase=True)
+            # p.resetBasePositionAndOrientation(armId, [0, 0, 0], [0, 0, 0, 1])
+            for i, q in enumerate(th):
+                p.resetJointState(armId, i, q.item())
 
-        try:
-            from base_experiments.env.env import draw_ordered_end_points
-            from base_experiments.env.pybullet_env import DebugDrawer
-            vis = DebugDrawer(1., 1.5)
-            vis.toggle_3d(True)
-            vis.set_camera_position([-0.1, 0, 0], yaw=-30, pitch=-20)
-            # draw bounding box for each link (set breakpoints here to better see the link frame bounding box)
-            tfs = s.sdf.obj_frame_to_link_frame.inverse()
-            for i in range(len(th)):
-                sdf = s.sdf.sdfs[i]
-                aabb = pv.aabb_to_ordered_end_points(np.array(sdf.ranges))
-                aabb = tfs.transform_points(torch.tensor(aabb, device=tfs.device, dtype=tfs.dtype))[i]
-                draw_ordered_end_points(vis, aabb)
-                time.sleep(0.2)
+            try:
+                from base_experiments.env.env import draw_ordered_end_points
+                from base_experiments.env.pybullet_env import DebugDrawer
+                vis = DebugDrawer(1., 1.5)
+                vis.toggle_3d(True)
+                vis.set_camera_position([-0.1, 0, 0], yaw=-30, pitch=-20)
+                # draw bounding box for each link (set breakpoints here to better see the link frame bounding box)
+                tfs = s.sdf.obj_frame_to_link_frame.inverse()
+                for i in range(len(th)):
+                    sdf = s.sdf.sdfs[i]
+                    aabb = pv.aabb_to_ordered_end_points(np.array(sdf.ranges))
+                    aabb = tfs.transform_points(torch.tensor(aabb, device=tfs.device, dtype=tfs.dtype))[i]
+                    draw_ordered_end_points(vis, aabb)
+                    time.sleep(0.2)
 
-            vis.draw_points("surface", pts[surface])
-        except:
-            pass
-        finally:
-            p.disconnect()
-    elif visualization == "open3d":
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(pts[surface].cpu().numpy())
-        if visualize:
-            o3d.visualization.draw_geometries(pv.get_transformed_meshes(s) + [pcd])
+                vis.draw_points("surface", pts[surface])
+            except:
+                pass
+            finally:
+                p.disconnect()
+        elif visualization == "open3d":
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(pts[surface].cpu().numpy())
+            if visualize:
+                o3d.visualization.draw_geometries(pv.get_transformed_meshes(s) + [pcd])
 
 
 def test_batch_over_configurations():
@@ -152,7 +153,7 @@ def test_bounding_box():
     s.set_joint_configuration(th)
 
     # toggles - g:GUI w:wireframe j:joint axis a:AABB i:interrupt
-    p.connect(p.GUI)
+    p.connect(p.GUI if visualize else p.DIRECT)
     p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0)
     p.setAdditionalSearchPath(search_path)
     armId = p.loadURDF(urdf, [0, 0, 0], useFixedBase=True)
@@ -160,27 +161,28 @@ def test_bounding_box():
     for i, q in enumerate(th):
         p.resetJointState(armId, i, q.item())
 
-    try:
-        from base_experiments.env.env import draw_ordered_end_points, draw_AABB
-        from base_experiments.env.pybullet_env import DebugDrawer
-        delay = 0.2
-        vis = DebugDrawer(1., 1.5)
-        vis.toggle_3d(True)
-        vis.set_camera_position([-0.1, 0, 0], yaw=-30, pitch=-20)
-        # draw bounding box for each link (set breakpoints here to better see the link frame bounding box)
-        bbs = s.link_bounding_boxes()
-        for i in range(len(s.sdf.sdfs)):
-            bb = bbs[i]
-            draw_ordered_end_points(vis, bb)
+    if visualize:
+        try:
+            from base_experiments.env.env import draw_ordered_end_points, draw_AABB
+            from base_experiments.env.pybullet_env import DebugDrawer
+            delay = 0.2
+            vis = DebugDrawer(1., 1.5)
+            vis.toggle_3d(True)
+            vis.set_camera_position([-0.1, 0, 0], yaw=-30, pitch=-20)
+            # draw bounding box for each link (set breakpoints here to better see the link frame bounding box)
+            bbs = s.link_bounding_boxes()
+            for i in range(len(s.sdf.sdfs)):
+                bb = bbs[i]
+                draw_ordered_end_points(vis, bb)
+                time.sleep(delay)
+            # total aabb
+            aabb = s.surface_bounding_box(padding=0)
+            draw_AABB(vis, aabb.cpu().numpy())
             time.sleep(delay)
-        # total aabb
-        aabb = s.surface_bounding_box(padding=0)
-        draw_AABB(vis, aabb.cpu().numpy())
-        time.sleep(delay)
-    except ImportError as e:
-        print(e)
+        except ImportError as e:
+            print(e)
 
-    time.sleep(2)
+        time.sleep(1)
     p.disconnect()
 
 
