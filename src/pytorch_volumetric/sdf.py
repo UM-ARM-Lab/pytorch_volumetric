@@ -68,7 +68,7 @@ class ObjectFactory(abc.ABC):
         return dd.draw_mesh(name, self.get_mesh_resource_filename(), pose, scale=self.scale, rgba=rgba,
                             object_id=object_id, vis_frame_pos=frame_pos, vis_frame_rot=self.vis_frame_rot)
 
-    def bounding_box(self, padding=0.):
+    def bounding_box(self, padding=0., padding_ratio=0):
         aabb = self._mesh.get_axis_aligned_bounding_box()
         world_min = aabb.get_min_bound()
         world_max = aabb.get_max_bound()
