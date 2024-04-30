@@ -111,7 +111,7 @@ class RobotScene:
 
     def visualize_robot(self, q: torch.Tensor, env_q: torch.Tensor = None):
         meshes = self.get_visualization_meshes(q, env_q)
-        o3d.visualization.draw_geometries(meshes, mesh_show_wireframe=True)
+        o3d.visualization.draw_geometries(meshes, mesh_show_wireframe=True, width=800, height=600)
 
     def _transform_to_world(self, q: torch.Tensor, weight=None):
         """
