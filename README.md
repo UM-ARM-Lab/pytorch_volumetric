@@ -28,6 +28,9 @@ obj = pv.MeshObjectFactory("YcbPowerDrill/textured_simple_reoriented.obj")
 sdf = pv.MeshSDF(obj)
 ```
 
+An `open3d` mesh can be provided via the `mesh=` argument to `MeshObjectFactory`. When doing so, transform parameters
+such as scale are ignored.
+
 ### Cached SDF
 
 ```python

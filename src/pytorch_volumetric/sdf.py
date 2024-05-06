@@ -30,6 +30,15 @@ class SDFQuery(NamedTuple):
 class ObjectFactory(abc.ABC):
     def __init__(self, name='', scale=1.0, vis_frame_pos=(0, 0, 0), vis_frame_rot=(0, 0, 0, 1),
                  plausible_suboptimality=0.001, mesh=None, **kwargs):
+        """
+        :param name: path to the mesh obj if loading from file
+        :param scale: scaling factor for the mesh
+        :param vis_frame_pos: position of the mesh in the object frame
+        :param vis_frame_rot: quaternion rotation of the mesh in the object frame
+        :param plausible_suboptimality: how much error to tolerate in the SDF
+        :param mesh: open3d mesh object; can be provided instead of the path to the mesh; however,
+        giving this directly means scale, vis_frame_pos, and vis_frame_rot are ignored
+        """
         self.name = name
         self.scale = scale if scale is not None else 1.0
         # frame from model's base frame to the simulation's use of the model
@@ -86,31 +95,29 @@ class ObjectFactory(abc.ABC):
         return self._mesh.get_center()
 
     def precompute_sdf(self):
-        if self._mesh is not None:
-            return
-        # scale mesh the approrpiate amount
-
-        full_path = self.get_mesh_high_poly_resource_filename()
-        full_path = os.path.expanduser(full_path)
-        if not os.path.exists(full_path):
-            raise RuntimeError(f"Expected mesh file does not exist: {full_path}")
-        self._mesh = o3d.io.read_triangle_mesh(full_path)
-        # scale mesh
-        scale_transform = np.eye(4)
-        np.fill_diagonal(scale_transform[:3, :3], self.scale)
-        self._mesh.transform(scale_transform)
+        if self._mesh is None:
+            full_path = self.get_mesh_high_poly_resource_filename()
+            full_path = os.path.expanduser(full_path)
+            if not os.path.exists(full_path):
+                raise RuntimeError(f"Expected mesh file does not exist: {full_path}")
+            self._mesh = o3d.io.read_triangle_mesh(full_path)
+            # scale mesh
+            scale_transform = np.eye(4)
+            np.fill_diagonal(scale_transform[:3, :3], self.scale)
+            self._mesh.transform(scale_transform)
             
-        # convert from mesh object frame to simulator object frame
-        x, y, z, w = self.vis_frame_rot
-        self._mesh = self._mesh.rotate(o3d.geometry.get_rotation_matrix_from_quaternion((w, x, y, z)),
-                                       center=[0, 0, 0])
-        self._mesh = self._mesh.translate(np.array(self.vis_frame_pos) * self.scale)
+            # convert from mesh object frame to simulator object frame
+            x, y, z, w = self.vis_frame_rot
+            self._mesh = self._mesh.rotate(o3d.geometry.get_rotation_matrix_from_quaternion((w, x, y, z)),
+                                           center=[0, 0, 0])
+            self._mesh = self._mesh.translate(np.array(self.vis_frame_pos) * self.scale)
 
-        self._mesht = o3d.t.geometry.TriangleMesh.from_legacy(self._mesh)
-        self._raycasting_scene = o3d.t.geometry.RaycastingScene()
-        _ = self._raycasting_scene.add_triangles(self._mesht)
-        self._mesh.compute_triangle_normals()
-        self._face_normals = np.asarray(self._mesh.triangle_normals)
+        if self._mesht is None:
+            self._mesht = o3d.t.geometry.TriangleMesh.from_legacy(self._mesh)
+            self._raycasting_scene = o3d.t.geometry.RaycastingScene()
+            _ = self._raycasting_scene.add_triangles(self._mesht)
+            self._mesh.compute_triangle_normals()
+            self._face_normals = np.asarray(self._mesh.triangle_normals)
 
     @tensor_utils.handle_batch_input(n=2)
     def _do_object_frame_closest_point(self, points_in_object_frame, compute_normal=False):
