@@ -135,7 +135,8 @@ def voxel_down_sample(points, resolution, range_per_dim=None, ignore_flat_dim=Fa
     """
     if points.shape[0] == 0:
         return points
-    data_bounds = np.stack((points.min(dim=0)[0].cpu().numpy(), points.max(dim=0)[0].cpu().numpy())).T
+    data_bounds = np.stack((points.min(dim=0)[0].cpu().numpy() - resolution * 2,
+                            points.max(dim=0)[0].cpu().numpy() + resolution * 2)).T
     if range_per_dim is None or bounds_contain_another_bounds(range_per_dim, data_bounds):
         range_per_dim = data_bounds
 
@@ -154,4 +155,3 @@ def voxel_down_sample(points, resolution, range_per_dim=None, ignore_flat_dim=Fa
     if flat_z:
         pts = torch.cat((pts, torch.ones((pts.shape[0], 1), device=device) * flat_z_val), dim=-1)
     return pts
-
