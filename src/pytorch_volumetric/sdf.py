@@ -105,7 +105,7 @@ class ObjectFactory(abc.ABC):
             scale_transform = np.eye(4)
             np.fill_diagonal(scale_transform[:3, :3], self.scale)
             self._mesh.transform(scale_transform)
-            
+
             # convert from mesh object frame to simulator object frame
             x, y, z, w = self.vis_frame_rot
             self._mesh = self._mesh.rotate(o3d.geometry.get_rotation_matrix_from_quaternion((w, x, y, z)),
