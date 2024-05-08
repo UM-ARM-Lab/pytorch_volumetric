@@ -20,6 +20,16 @@ def pairwise_distance(world_to_link_tfs: pk.Transform3d):
 def pairwise_distance_chamfer(world_to_link_tfs: pk.Transform3d, obj_factory: ObjectFactory = None,
                               obj_sdf: ObjectFrameSDF = None,
                               model_points_eval: torch.tensor = None, vis=None, scale=1000):
+    """
+    Compute the pairwise chamfer distance between a set of world to link transforms of an object.
+    :param world_to_link_tfs: B x 4 x 4 world to link frame transforms
+    :param obj_factory: object factory to evaluate against
+    :param obj_sdf: object sdf to evaluate against (accelerates the computation at the cost of accuracy)
+    :param model_points_eval: points to evaluate the chamfer distance on; if None, sample from the object
+    :param vis: visualizer
+    :param scale: units with respect to the position units; e.g. if the position units are in meters, then the scale=1
+    :return: B x B chamfer distance matrix in squared distance units, averaged across the model_points_eval
+    """
     if model_points_eval is None:
         model_points_eval, _, _ = sample_mesh_points(obj_factory, num_points=500, name=obj_factory.name,
                                                      device=world_to_link_tfs.device)
