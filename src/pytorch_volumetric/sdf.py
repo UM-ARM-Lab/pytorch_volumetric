@@ -282,6 +282,23 @@ class ObjectFrameSDF(abc.ABC):
         return model_voxels.ensure_value_key(indices)
 
 
+class SphereSDF(ObjectFrameSDF):
+    """SDF for a geometric primitive, the sphere centered at the origin"""
+
+    def __init__(self, radius):
+        self.radius = radius
+
+    def __call__(self, points_in_object_frame):
+        dist_to_origin = torch.linalg.norm(points_in_object_frame, dim=-1)
+        dist = dist_to_origin - self.radius
+        grad = points_in_object_frame / (dist_to_origin.unsqueeze(-1) + 1e-12)
+        return dist, grad
+
+    def surface_bounding_box(self, padding=0., padding_ratio=0.):
+        length = self.radius + padding + padding_ratio * self.radius
+        return torch.tensor([[-length, length], [-length, length], [-length, length]])
+
+
 class MeshSDF(ObjectFrameSDF):
     """SDF generated from direct ray-tracing calls to the mesh. This is relatively expensive."""
 
