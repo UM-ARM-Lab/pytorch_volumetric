@@ -16,7 +16,7 @@ class RobotScene:
 
     def __init__(self, robot_sdf: model_to_sdf.RobotSDF, scene_sdf: sdf.ObjectFrameSDF, scene_transform: pk.Transform3d,
                  threshold: float = 0.002, points_per_link: int = 100, softmin_temp: float = 1000,
-                 collision_check_links: typing.List[str] = None
+                 collision_check_links: typing.List[str] = None, partial_patch=False,
                  ):
         """
         :param robot_sdf: the robot sdf
@@ -45,7 +45,7 @@ class RobotScene:
         self.num_links = len(self.robot_sdf.sdf_to_link_name)
 
         self.scene_transform = scene_transform.to(device=self.device)
-        self.robot_query_points, self._query_point_mask = self._generate_robot_query_points()
+        self.robot_query_points, self._query_point_mask = self._generate_robot_query_points(partial_patch=partial_patch)
 
         self.transform_points = vmap(self._transform_points)
         self.transform_to_world = vmap(self._transform_to_world)
@@ -61,7 +61,7 @@ class RobotScene:
         tfs = tfs[self.desired_link_idx].reshape(-1, 4, 4)
         return pk.Transform3d(matrix=tfs)
 
-    def _generate_robot_query_points(self):
+    def _generate_robot_query_points(self, partial_patch=False):
         query_points = []
         for i, link_name in enumerate(self.robot_sdf.sdf_to_link_name):
             if link_name in self.desired_links:
@@ -71,6 +71,28 @@ class RobotScene:
                 #                                      dbpath=f'{link_name}_points_cache.pkl', device=self.device)
                 points, _ = link_sdf.sample_surface_points(self.points_per_link,
                                                            dbpath=f'{link_name}_points_cache.pkl', device=self.device)
+
+                if partial_patch:
+                    ee_names = ['allegro_hand_hitosashi_finger_finger_0_aftc_base_link',
+                    'allegro_hand_naka_finger_finger_1_aftc_base_link',
+                    'allegro_hand_kusuri_finger_finger_2_aftc_base_link',
+                    'allegro_hand_oya_finger_3_aftc_base_link']
+                    loc1, = torch.where(points[:, 1] > 0.005)
+                    points = points[loc1]
+                    loc2, = torch.where(points[:, 2] > 0.01)
+                    points = points[loc2]
+                    while points.shape[0] < self.points_per_link:
+                        new_points, _ = link_sdf.sample_surface_points(self.points_per_link,
+                                                                       dbpath=f'{link_name}_points_cache.pkl', device=self.device)
+                        loc1, = torch.where(new_points[:, 1] > 0.005)
+                        new_points = new_points[loc1]
+                        if link_name in ee_names:
+                            loc2, = torch.where(new_points[:, 2] > 0.018)
+                        else:
+                            loc2, = torch.where(new_points[:, 2] > 0.01)
+                        new_points = new_points[loc2]
+                        points = torch.cat([points, new_points], dim=0)     
+                    points = points[:self.points_per_link]
 
                 query_points.append(points)
                 # TODO: confusing because index from robot_sdf and from chain are not the same, perhaps unify them?
