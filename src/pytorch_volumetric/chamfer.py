@@ -17,12 +17,14 @@ def pairwise_distance(world_to_link_tfs: pk.Transform3d):
     return torch.cdist(cont_rep, cont_rep)
 
 
-def pairwise_distance_chamfer(world_to_link_tfs: pk.Transform3d, obj_factory: ObjectFactory = None,
+def pairwise_distance_chamfer(A_link_to_world_tfs: pk.Transform3d, B_world_to_link_tfs: pk.Transform3d = None,
+                              obj_factory: ObjectFactory = None,
                               obj_sdf: ObjectFrameSDF = None,
                               model_points_eval: torch.tensor = None, vis=None, scale=1000):
     """
     Compute the pairwise chamfer distance between a set of world to link transforms of an object.
-    :param world_to_link_tfs: B x 4 x 4 world to link frame transforms
+    :param A_link_to_world_tfs: B x 4 x 4 link frame to world frame transforms
+    :param B_world_to_link_tfs: P x 4 x 4 world frame to link frame transforms, if None, then the inverse of A will be used
     :param obj_factory: object factory to evaluate against
     :param obj_sdf: object sdf to evaluate against (accelerates the computation at the cost of accuracy)
     :param model_points_eval: points to evaluate the chamfer distance on; if None, sample from the object
@@ -32,17 +34,21 @@ def pairwise_distance_chamfer(world_to_link_tfs: pk.Transform3d, obj_factory: Ob
     """
     if model_points_eval is None:
         model_points_eval, _, _ = sample_mesh_points(obj_factory, num_points=500, name=obj_factory.name,
-                                                     device=world_to_link_tfs.device)
-    B = len(world_to_link_tfs)
-    P = B
+                                                     device=A_link_to_world_tfs.device)
 
     # effectively can apply one transform then take the inverse using the other one; if they are the same, then
     # we should end up in the base frame if that T == Tp
     # want pairwise matrix multiplication |T| x |Tp| x 4 x 4 T[0]@Tp[0], T[0]@Tp[1]
-    T = world_to_link_tfs.get_matrix()
-    # this is fastor than inverting the 4x4 since we can exploit orthogonality
-    T_inv = world_to_link_tfs.inverse().get_matrix()
+    T = A_link_to_world_tfs.get_matrix()
+    if B_world_to_link_tfs is None:
+        # this is fastor than inverting the 4x4 since we can exploit orthogonality
+        T_inv = A_link_to_world_tfs.inverse().get_matrix()
+    else:
+        T_inv = B_world_to_link_tfs.get_matrix()
     Iapprox = torch.einsum("bij,pjk->bpik", T_inv, T)
+
+    B = len(T)
+    P = len(T_inv)
     # the einsum does the multiplication below and is about twice as fast
     # Iapprox = T.inverse().view(-1, 1, 4, 4) @ T.view(1, -1, 4, 4)
 
