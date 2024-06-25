@@ -113,12 +113,12 @@ class RobotScene:
     def get_visualization_meshes(self, q: torch.Tensor, env_q: torch.Tensor = None):
         pcd = o3d.geometry.PointCloud()
         self.robot_sdf.set_joint_configuration(q)
-        if env_q is not None:
-            self.scene_sdf.set_joint_configuration(env_q)
 
         tfs = self._get_desired_tfs().inverse()
         pts = tfs.transform_points(self.robot_query_points).reshape(-1, 3)
         pcd.points = o3d.utility.Vector3dVector(pts.cpu().numpy())
+        if env_q is not None:
+            self.scene_sdf.set_joint_configuration(env_q)
         self.scene_sdf.precompute_sdf()
         scene_meshes = self.scene_sdf.get_mesh_list()
         scene_transform = self.scene_transform.get_matrix().cpu().numpy().astype(np.float64).reshape((4, 4))
@@ -216,12 +216,22 @@ class RobotScene:
             closest_sdf_vals = sdf_vals[B_range, closest_indices]
             h = torch.softmax(-self.softmin_temp * closest_sdf_vals, dim=1)
 
-            new_grad = False
+            new_grad = True
             pts_hessian = None
             if new_grad:
+                eye = torch.eye(self.grad_smooth_points, device=self.device).unsqueeze(0).repeat(B, 1, 1)
+                grad_h = -self.softmin_temp * (torch.diag_embed(h) * eye - h.unsqueeze(-1) * h.unsqueeze(-2))
                 # want the closest points in the link frame
-                closest_pts = self.robot_query_points.reshape(B, -1, 3)[B_range, closest_indices].reshape(-1, 3)
+                closest_pts = self.robot_query_points.repeat(B, 1, 1, 1).reshape(B, -1, 3)[B_range, closest_indices].reshape(-1, 3)
+
+                # closest points in world frame
+                closest_pts_world = pts_world.reshape(B, -1, 3)[B_range, closest_indices]
+
+                # closest points in scene frame
+                closest_pts_scene = pts.reshape(B, -1, 3)[B_range, closest_indices].reshape(-1, 3)
+
                 closest_links = self.desired_frame_idx[closest_indices // self.points_per_link].reshape(-1)
+
                 q_repeat = q.unsqueeze(1).repeat(1, self.grad_smooth_points, 1).reshape(B * self.grad_smooth_points, -1)
                 if not compute_hessian:
                     pts_jacobian = self.robot_sdf.chain.jacobian(q_repeat,
@@ -239,8 +249,46 @@ class RobotScene:
                 sdf_grad_world_frame = self.scene_transform.transform_normals(
                     sdf_weighted_grad.reshape(-1, 3)).reshape(B, self.grad_smooth_points, 3)
 
+
+                # sdf gradients in world frame
+                closest_sdf_grads_world = self.scene_transform.transform_normals(
+                    closest_sdf_grads.reshape(-1, 3)).reshape(B, self.grad_smooth_points, 3)
+
+                # Compute gradient of closest point with respect to robot points in world frame
+                dh_dx = grad_h.unsqueeze(-1) * closest_sdf_grads_world.unsqueeze(-2)
+                dclosest_dx = dh_dx.permute(0, 3, 1, 2) @ closest_pts_world.permute(0, 2, 1).unsqueeze(-1)
+                dclosest_dx = h[:, :, None] + dclosest_dx.permute(0, 2, 1, 3).squeeze(-1)
+                closest_pts_grad = dclosest_dx
+
+                # this closest point grad is B x N x 3
+                # it should be B x 3 x N x 3 ->
+                closest_pts_grad = torch.diag_embed(closest_pts_grad).permute(0, 2, 1, 3)
+                pts_jac_expanded = pts_jacobian.transpose(2, 3).unsqueeze(1).expand(B, 3, self.grad_smooth_points, -1, 3)
+                dclosest_dq = (pts_jac_expanded @ closest_pts_grad.unsqueeze(-1)).squeeze(-1)
+                dclosest_dq = torch.sum(dclosest_dq, dim=2)
+
                 q_grad = (pts_jacobian.transpose(2, 3) @ sdf_grad_world_frame.unsqueeze(-1)).squeeze(-1)
                 rvals['grad_sdf'] = torch.sum(q_grad, dim=1)  # B x 14
+
+                rvals['closest_pt_world'] = torch.sum(h[:, :, None] * closest_pts_world, dim=1)  # B x 3
+                rvals['closest_pt_q_grad'] = dclosest_dq  # B x 3 x 14
+
+                ## alternative to doing this, we instead recompute contact jacobian and hessian at the closest point?
+                rvals['contact_jacobian'] = torch.sum(h[:, :, None, None] * pts_jacobian, dim=1)  # B x 3 x 16
+                ## now want to get the contact hessian dJ/dq
+                # rvals['contact_hessian'] = torch.sum(h[:, :, None, None, None] * pts_hessian, dim=1)  # B x 3 x 14 x 14
+
+                # get contact normals
+                rvals['contact_normal'] = torch.sum(sdf_grad_world_frame, dim=1)
+                rvals['contact_normal'] = rvals['contact_normal'] / torch.norm(rvals['contact_normal'], dim=1, keepdim=True)
+
+                closest_sdf_hess = sdf_hess[B_range, closest_indices]
+                sdf_weighted_hess = h[:, :, None, None] * closest_sdf_hess
+                sdf_hess_world_frame = self.scene_transform.transform_shape_operator(
+                    sdf_weighted_hess.reshape(-1, 3, 3)).reshape(B, self.grad_smooth_points, 3, 3)
+
+                rvals['dnormal_dq'] = torch.sum(sdf_hess_world_frame @ pts_jacobian, dim=1)
+
 
             else:
                 h = torch.softmax(-self.softmin_temp * sdf_vals, dim=1)
@@ -316,7 +364,6 @@ class RobotScene:
             closest_sdf_grads = sdf_grads[B_range, closest_indices]
             closest_sdf_vals = sdf_vals[B_range, closest_indices]
             h = torch.softmax(-self.softmin_temp * closest_sdf_vals, dim=1)
-            new_grad = True
             pts_hessian = None
             eye = torch.eye(self.grad_smooth_points, device=self.device).unsqueeze(0).repeat(B, 1, 1)
             grad_h = -self.softmin_temp * (torch.diag_embed(h) * eye - h.unsqueeze(-1) * h.unsqueeze(-2))
