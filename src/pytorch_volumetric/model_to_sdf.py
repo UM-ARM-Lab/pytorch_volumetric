@@ -53,7 +53,7 @@ class RobotSDF(sdf.ObjectFrameSDF):
                     sdfs.append(link_sdf)
                     offsets.append(link_vis.offset)
                 else:
-                    logger.warning(f"Cannot handle non-mesh link visual type {link_vis}")
+                    logger.warning(f"Cannot handle non-mesh link visual type {link_vis} for {frame.link.name}")
 
         self.offset_transforms = offsets[0].stack(*offsets[1:]).to(device=self.device, dtype=self.dtype)
         self.sdf = sdf.ComposedSDF(sdfs, self.object_to_link_frames)
@@ -96,7 +96,7 @@ class RobotSDF(sdf.ObjectFrameSDF):
             joint_config = joint_config.reshape(-1, M)
         else:
             self.configuration_batch = None
-        tf = self.chain.forward_kinematics(joint_config, end_only=False)
+        tf = self.chain.forward_kinematics(joint_config)
         tsfs = []
         for link_name in self.sdf_to_link_name:
             tsfs.append(tf[link_name].get_matrix())
