@@ -472,6 +472,12 @@ class CachedSDF(ObjectFrameSDF):
         self.gt_sdf = gt_sdf
         self.resolution = resolution
 
+        bb = np.array(range_per_dim)
+        r = bb[:, 1] - bb[:, 0]
+        num_voxel = r // resolution
+        if min(num_voxel) < 10:
+            logger.warning(f"Resolution {resolution} is too high for {object_name}, only getting {num_voxel} voxels.")
+
         range_per_dim = get_divisible_range_by_resolution(resolution, range_per_dim)
         self.ranges = range_per_dim
 
