@@ -63,6 +63,18 @@ class VoxelGrid(Voxels):
         val = self.voxels.raw_data[indices]
         return pos, val
 
+    def resize_to_fit(self):
+        """Resize voxel grid to fit to the known points"""
+        known_pos, known_val = self.get_known_pos_and_values()
+        min = known_pos.min(dim=0).values
+        max = known_pos.max(dim=0).values
+        # fit to the min and max of data
+        range_per_dim = copy.deepcopy(self.range_per_dim)
+        for dim in range(len(min)):
+            range_per_dim[dim] = (min[dim].item() - self.resolution, max[dim].item() + self.resolution)
+        self._create_voxels(self.resolution, range_per_dim)
+        self.__setitem__(known_pos, known_val)
+
     def get_voxel_values(self):
         """Get the raw value of the voxels without any coordinate information"""
         return self._data
