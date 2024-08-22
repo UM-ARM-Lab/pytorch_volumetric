@@ -96,7 +96,7 @@ class RobotSDF(sdf.ObjectFrameSDF):
             joint_config = joint_config.reshape(-1, M)
         else:
             self.configuration_batch = None
-        tf = self.chain.forward_kinematics(joint_config)
+        tf = self.chain.forward_kinematics(joint_config, end_only=False)
         tsfs = []
         for link_name in self.sdf_to_link_name:
             tsfs.append(tf[link_name].get_matrix())
