@@ -7,7 +7,8 @@
 
 SDF slice animated over a KUKA robot
 
-![robot SDF](https://i.imgur.com/0lzhWcq.gif)
+![pv_sdf_slice](https://github.com/user-attachments/assets/d9081706-6463-4716-82ec-b278969d24f4)
+
 
 ## Installation
 
