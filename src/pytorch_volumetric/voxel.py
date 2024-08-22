@@ -66,6 +66,8 @@ class VoxelGrid(Voxels):
     def resize_to_fit(self):
         """Resize voxel grid to fit to the known points"""
         known_pos, known_val = self.get_known_pos_and_values()
+        if known_pos.numel() == 0:
+            return
         min = known_pos.min(dim=0).values
         max = known_pos.max(dim=0).values
         # fit to the min and max of data
