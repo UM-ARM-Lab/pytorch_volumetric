@@ -4,3 +4,5 @@ dist
 *.egg-info
 *.pyc
 *.pkl
+*.mp4
+tests/intermediate_meshes

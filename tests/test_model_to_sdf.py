@@ -43,8 +43,6 @@ def _make_robot_translucent(robot_id, alpha=0.4):
 
 
 def test_urdf_to_sdf():
-    # visualization = "open3d"
-    # visualization = "pybullet"
     urdf = "kuka_iiwa/model.urdf"
     search_path = pybullet_data.getDataPath()
     full_urdf = os.path.join(search_path, urdf)
@@ -63,31 +61,30 @@ def test_urdf_to_sdf():
     # plt.show()
 
     if visualize:
+        save_dir = "intermediate_meshes"
+        os.makedirs(save_dir, exist_ok=True)
         # toggles - g:GUI w:wireframe j:joint axis a:AABB i:interrupt
         p.connect(p.GUI)
-        # record video
         p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0)
         p.setAdditionalSearchPath(search_path)
         armId = p.loadURDF(urdf, [0, 0, 0], useFixedBase=True)
-        # p.resetBasePositionAndOrientation(armId, [0, 0, 0], [0, 0, 0, 1])
         for i, q in enumerate(th):
             p.resetJointState(armId, i, q.item())
 
         _make_robot_translucent(armId, alpha=0.5)
 
         from base_experiments.env.pybullet_env import DebugDrawer
-        vis = DebugDrawer(0.5, 0.8)
+        vis = DebugDrawer(0.3, 0.5)
         vis.toggle_3d(True)
-        vis.set_camera_position([-0.2, 0, 0.3], yaw=-70, pitch=-15)
+        vis.set_camera_position([-0.35, 0, 0.35], yaw=-70, pitch=-15)
 
+        # record video
         p.startStateLogging(p.STATE_LOGGING_VIDEO_MP4, "video.mp4")
 
         # expected SDF value range
         norm = matplotlib.colors.Normalize(vmin=-0.15, vmax=0.35)
         m = cm.ScalarMappable(norm=norm, cmap=cm.jet)
         sdf_id = None
-
-        # input("position the camera and press enter to start the animation")
 
         # sweep across to animate it
         for x in np.linspace(-0.8, 0.5, 100):
@@ -103,7 +100,13 @@ def test_urdf_to_sdf():
             # pts = ret[2]
             coords, pts = pv.get_coordinates_and_points_in_grid(resolution, query_range, device=s.device)
 
-            sdf_val, sdf_grad = s(pts + torch.randn_like(pts) * 0e-6)
+            # query multiple times and select the median to remove artifacts
+            extra_queries = 10
+            sdf_val, sdf_grad = s(
+                pts + torch.randn((extra_queries, pts.shape[0], pts.shape[1]), device=s.device) * 1e-4)
+            sdf_val = sdf_val.reshape(extra_queries, -1)
+            sdf_val = sdf_val.median(dim=0).values
+
             sdf_color = m.to_rgba(sdf_val.cpu())
 
             # Assume grid dimensions (rows and cols). You need to know or compute these.
@@ -112,7 +115,6 @@ def test_urdf_to_sdf():
 
             # Generating the faces (triangulating the grid cells)
             faces = []
-            # face_colors = []
             for c in range(cols - 1):
                 for r in range(rows - 1):
                     # Compute indices of the vertices of the quadrilateral cell in column-major order
@@ -124,20 +126,16 @@ def test_urdf_to_sdf():
                     # Two triangles per grid cell
                     faces.append([idx0, idx1, idx2])
                     faces.append([idx0, idx2, idx3])
-                    # color is average of the 3 vertices
-                    # face_colors.append(sdf_color[[idx0, idx1, idx2]].mean(axis=0))
-                    # face_colors.append(sdf_color[[idx0, idx2, idx3]].mean(axis=0))
+
             faces = np.array(faces)
 
             # surface = sdf_val.abs() < 0.005
             # set alpha
-            # sdf_color[:, -1] = 0.5
 
-            # TODO draw mesh of level set
+            # draw mesh of level set
             # Create the mesh
             this_mesh = pymeshlab.Mesh(vertex_matrix=pts.cpu().numpy(), face_matrix=faces,
                                        v_color_matrix=sdf_color,
-                                       # f_color_matrix=face_colors
                                        )
             # create and save mesh
             ms = pymeshlab.MeshSet()
@@ -148,22 +146,21 @@ def test_urdf_to_sdf():
             ms.compute_texcoord_parametrization_triangle_trivial_per_wedge()
             ms.compute_texmap_from_color(textname=f"tex_{base_name}")
 
-            print(f"has vertex colors: {this_mesh.has_vertex_color()}")
-            print(f"has face colors: {this_mesh.has_face_color()}")
-            print(f"has vertex tex coords: {this_mesh.has_vertex_tex_coord()}")
+            # print(f"has vertex colors: {this_mesh.has_vertex_color()}")
+            # print(f"has face colors: {this_mesh.has_face_color()}")
+            # print(f"has vertex tex coords: {this_mesh.has_vertex_tex_coord()}")
 
             # Check vertex colors are set correctly
-            assert ms.current_mesh().vertex_number() == len(sdf_color), "Mismatch in vertex counts"
-            # check vertex colors
-            mvc = ms.current_mesh().vertex_color_matrix()
-            print(mvc.shape)
-            print(mvc)
-            print(sdf_color.shape)
-            print(sdf_color)
+            # assert ms.current_mesh().vertex_number() == len(sdf_color), "Mismatch in vertex counts"
+            # # check vertex colors
+            # mvc = ms.current_mesh().vertex_color_matrix()
+            # print(mvc.shape)
+            # print(mvc)
+            # print(sdf_color.shape)
+            # print(sdf_color)
             # assert np.allclose(mvc, sdf_color), "Mismatch in vertex colors"
 
-            # fn = os.path.join(cfg.DATA_DIR, "shape_explore", f"mesh_{base_name}.obj")
-            fn = os.path.join(".", f"mesh_{base_name}.obj")
+            fn = os.path.join(save_dir, f"mesh_{base_name}.obj")
             ms.save_current_mesh(fn, save_vertex_color=True)
 
             prev_sdf_id = sdf_id
@@ -171,15 +168,6 @@ def test_urdf_to_sdf():
             sdf_id = p.createMultiBody(0, baseVisualShapeIndex=visId, basePosition=[0, 0, 0])
             if prev_sdf_id is not None:
                 p.removeBody(prev_sdf_id)
-
-            # time.sleep(0.1)
-
-            # # first plot the points
-            # from base_experiments.env.pybullet_env import DebugDrawer
-            # vis = DebugDrawer(1., 1.5)
-            # vis.toggle_3d(True)
-            #
-            # vis.draw_points("sdf", pts.cpu().numpy(), color=sdf_color[:, :3])
 
 
 def test_batch_over_configurations():
