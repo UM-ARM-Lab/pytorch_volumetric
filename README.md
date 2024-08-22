@@ -5,6 +5,10 @@
 - unidirectional chamfer distance (points to mesh)
 - robot model to SDF with parallelized query over robot configurations and points
 
+SDF slice animated over a KUKA robot
+
+![robot SDF](https://imgur.com/g2fgDVc.gif)
+
 ## Installation
 
 ```shell
