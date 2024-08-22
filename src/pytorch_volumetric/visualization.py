@@ -19,7 +19,7 @@ def fmt(x):
 
 
 def draw_sdf_slice(s: sdf.ObjectFrameSDF, query_range, resolution=0.01, interior_padding=0.2,
-                   cmap="Greys_r", device="cpu", plot_grad=False):
+                   cmap="Greys_r", device="cpu", plot_grad=False, do_plot=True):
     """
 
     :param s: SDF to query on
@@ -51,28 +51,32 @@ def draw_sdf_slice(s: sdf.ObjectFrameSDF, query_range, resolution=0.01, interior
     sdf_val, sdf_grad = s(pts)
     norm = matplotlib.colors.Normalize(vmin=sdf_val.min().cpu() - interior_padding, vmax=sdf_val.max().cpu())
 
-    ax = plt.gca()
-    ax.set_xlabel(dim_labels[shown_dims[0]])
-    ax.set_ylabel(dim_labels[shown_dims[1]])
     x = coords[shown_dims[0]].cpu()
     z = coords[shown_dims[1]].cpu()
     v = sdf_val.reshape(len(x), len(z)).transpose(0, 1).cpu()
-    cset1 = ax.contourf(x, z, v, norm=norm, cmap=cmap)
-    cset2 = ax.contour(x, z, v, colors='k', levels=[0], linestyles='dashed')
-    if plot_grad:
-        sdf_grad_uv = sdf_grad.reshape(len(x), len(z), 3).permute(1, 0, 2).cpu()
-        # subsample arrows
-        subsample_n = 5
-        ax.quiver(x[::subsample_n],
-                  z[::subsample_n],
-               sdf_grad_uv[::subsample_n, ::subsample_n, shown_dims[0]],
-               sdf_grad_uv[::subsample_n, ::subsample_n, shown_dims[1]], color='g')
-    ax.clabel(cset2, cset2.levels, inline=True, fontsize=13, fmt=fmt)
-    plt.colorbar(cset1)
-    # fig = plt.gcf()
-    # fig.canvas.draw()
-    plt.draw()
-    plt.pause(0.005)
+    ax = None
+    cset1 = None
+    cset2 = None
+    if do_plot:
+        ax = plt.gca()
+        ax.set_xlabel(dim_labels[shown_dims[0]])
+        ax.set_ylabel(dim_labels[shown_dims[1]])
+        cset1 = ax.contourf(x, z, v, norm=norm, cmap=cmap)
+        cset2 = ax.contour(x, z, v, colors='k', levels=[0], linestyles='dashed')
+        if plot_grad:
+            sdf_grad_uv = sdf_grad.reshape(len(x), len(z), 3).permute(1, 0, 2).cpu()
+            # subsample arrows
+            subsample_n = 5
+            ax.quiver(x[::subsample_n],
+                      z[::subsample_n],
+                      sdf_grad_uv[::subsample_n, ::subsample_n, shown_dims[0]],
+                      sdf_grad_uv[::subsample_n, ::subsample_n, shown_dims[1]], color='g')
+        ax.clabel(cset2, cset2.levels, inline=True, fontsize=13, fmt=fmt)
+        plt.colorbar(cset1)
+        # fig = plt.gcf()
+        # fig.canvas.draw()
+        plt.draw()
+        plt.pause(0.005)
     return sdf_val, sdf_grad, pts, ax, cset1, cset2, v
 
 

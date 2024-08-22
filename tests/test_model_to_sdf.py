@@ -1,3 +1,4 @@
+import pymeshlab
 import os
 import math
 import torch
@@ -8,6 +9,9 @@ from timeit import default_timer as timer
 import open3d as o3d
 import pytorch_kinematics as pk
 import pytorch_volumetric as pv
+
+import matplotlib
+from matplotlib import cm
 
 import pybullet as p
 import pybullet_data
@@ -26,8 +30,21 @@ TEST_DIR = os.path.dirname(__file__)
 visualize = True
 
 
+def _make_robot_translucent(robot_id, alpha=0.4):
+    def make_transparent(link):
+        link_id = link[1]
+        rgba = list(link[7])
+        rgba[3] = alpha
+        p.changeVisualShape(robot_id, link_id, rgbaColor=rgba)
+
+    visual_data = p.getVisualShapeData(robot_id)
+    for link in visual_data:
+        make_transparent(link)
+
+
 def test_urdf_to_sdf():
-    visualization = "open3d"
+    # visualization = "open3d"
+    # visualization = "pybullet"
     urdf = "kuka_iiwa/model.urdf"
     search_path = pybullet_data.getDataPath()
     full_urdf = os.path.join(search_path, urdf)
@@ -42,58 +59,127 @@ def test_urdf_to_sdf():
 
     s.set_joint_configuration(th)
 
-    y = 0.02
-    query_range = np.array([
-        [-1, 0.5],
-        [y, y],
-        [-0.2, 0.8],
-    ])
-
-    plt.ion()
-    plt.show()
+    # plt.ion()
+    # plt.show()
 
     if visualize:
-        ret = pv.draw_sdf_slice(s, query_range, resolution=0.01, device=s.device)
-        sdf_val = ret[0]
-        pts = ret[2]
+        # toggles - g:GUI w:wireframe j:joint axis a:AABB i:interrupt
+        p.connect(p.GUI)
+        # record video
+        p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0)
+        p.setAdditionalSearchPath(search_path)
+        armId = p.loadURDF(urdf, [0, 0, 0], useFixedBase=True)
+        # p.resetBasePositionAndOrientation(armId, [0, 0, 0], [0, 0, 0, 1])
+        for i, q in enumerate(th):
+            p.resetJointState(armId, i, q.item())
 
-        surface = sdf_val.abs() < 0.005
+        _make_robot_translucent(armId, alpha=0.5)
 
-        if visualization == "pybullet":
-            # toggles - g:GUI w:wireframe j:joint axis a:AABB i:interrupt
-            p.connect(p.GUI)
-            p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0)
-            p.setAdditionalSearchPath(search_path)
-            armId = p.loadURDF(urdf, [0, 0, 0], useFixedBase=True)
-            # p.resetBasePositionAndOrientation(armId, [0, 0, 0], [0, 0, 0, 1])
-            for i, q in enumerate(th):
-                p.resetJointState(armId, i, q.item())
+        from base_experiments.env.pybullet_env import DebugDrawer
+        vis = DebugDrawer(0.5, 0.8)
+        vis.toggle_3d(True)
+        vis.set_camera_position([-0.2, 0, 0.3], yaw=-70, pitch=-15)
 
-            try:
-                from base_experiments.env.env import draw_ordered_end_points
-                from base_experiments.env.pybullet_env import DebugDrawer
-                vis = DebugDrawer(1., 1.5)
-                vis.toggle_3d(True)
-                vis.set_camera_position([-0.1, 0, 0], yaw=-30, pitch=-20)
-                # draw bounding box for each link (set breakpoints here to better see the link frame bounding box)
-                tfs = s.sdf.obj_frame_to_link_frame.inverse()
-                for i in range(len(th)):
-                    sdf = s.sdf.sdfs[i]
-                    aabb = pv.aabb_to_ordered_end_points(np.array(sdf.ranges))
-                    aabb = tfs.transform_points(torch.tensor(aabb, device=tfs.device, dtype=tfs.dtype))[i]
-                    draw_ordered_end_points(vis, aabb)
-                    time.sleep(0.2)
+        p.startStateLogging(p.STATE_LOGGING_VIDEO_MP4, "video.mp4")
 
-                vis.draw_points("surface", pts[surface])
-            except:
-                pass
-            finally:
-                p.disconnect()
-        elif visualization == "open3d":
-            pcd = o3d.geometry.PointCloud()
-            pcd.points = o3d.utility.Vector3dVector(pts[surface].cpu().numpy())
-            if visualize:
-                o3d.visualization.draw_geometries(pv.get_transformed_meshes(s) + [pcd])
+        # expected SDF value range
+        norm = matplotlib.colors.Normalize(vmin=-0.15, vmax=0.35)
+        m = cm.ScalarMappable(norm=norm, cmap=cm.jet)
+        sdf_id = None
+
+        # input("position the camera and press enter to start the animation")
+
+        # sweep across to animate it
+        for x in np.linspace(-0.8, 0.5, 100):
+            query_range = np.array([
+                [x, x],
+                [-0.3, 0.3],
+                [-0.2, 0.8],
+            ])
+
+            resolution = 0.01
+            # ret = pv.draw_sdf_slice(s, query_range, resolution=resolution, device=s.device, do_plot=False)
+            # sdf_val = ret[0]
+            # pts = ret[2]
+            coords, pts = pv.get_coordinates_and_points_in_grid(resolution, query_range, device=s.device)
+
+            sdf_val, sdf_grad = s(pts + torch.randn_like(pts) * 0e-6)
+            sdf_color = m.to_rgba(sdf_val.cpu())
+
+            # Assume grid dimensions (rows and cols). You need to know or compute these.
+            rows = len(coords[2])
+            cols = len(coords[1])
+
+            # Generating the faces (triangulating the grid cells)
+            faces = []
+            # face_colors = []
+            for c in range(cols - 1):
+                for r in range(rows - 1):
+                    # Compute indices of the vertices of the quadrilateral cell in column-major order
+                    idx0 = c * rows + r
+                    idx1 = c * rows + (r + 1)
+                    idx2 = (c + 1) * rows + (r + 1)
+                    idx3 = (c + 1) * rows + r
+
+                    # Two triangles per grid cell
+                    faces.append([idx0, idx1, idx2])
+                    faces.append([idx0, idx2, idx3])
+                    # color is average of the 3 vertices
+                    # face_colors.append(sdf_color[[idx0, idx1, idx2]].mean(axis=0))
+                    # face_colors.append(sdf_color[[idx0, idx2, idx3]].mean(axis=0))
+            faces = np.array(faces)
+
+            # surface = sdf_val.abs() < 0.005
+            # set alpha
+            # sdf_color[:, -1] = 0.5
+
+            # TODO draw mesh of level set
+            # Create the mesh
+            this_mesh = pymeshlab.Mesh(vertex_matrix=pts.cpu().numpy(), face_matrix=faces,
+                                       v_color_matrix=sdf_color,
+                                       # f_color_matrix=face_colors
+                                       )
+            # create and save mesh
+            ms = pymeshlab.MeshSet()
+            ms.add_mesh(this_mesh, "sdf")
+
+            # UV map and turn vertex coloring into a texture
+            base_name = f"sdf_{x}"
+            ms.compute_texcoord_parametrization_triangle_trivial_per_wedge()
+            ms.compute_texmap_from_color(textname=f"tex_{base_name}")
+
+            print(f"has vertex colors: {this_mesh.has_vertex_color()}")
+            print(f"has face colors: {this_mesh.has_face_color()}")
+            print(f"has vertex tex coords: {this_mesh.has_vertex_tex_coord()}")
+
+            # Check vertex colors are set correctly
+            assert ms.current_mesh().vertex_number() == len(sdf_color), "Mismatch in vertex counts"
+            # check vertex colors
+            mvc = ms.current_mesh().vertex_color_matrix()
+            print(mvc.shape)
+            print(mvc)
+            print(sdf_color.shape)
+            print(sdf_color)
+            # assert np.allclose(mvc, sdf_color), "Mismatch in vertex colors"
+
+            # fn = os.path.join(cfg.DATA_DIR, "shape_explore", f"mesh_{base_name}.obj")
+            fn = os.path.join(".", f"mesh_{base_name}.obj")
+            ms.save_current_mesh(fn, save_vertex_color=True)
+
+            prev_sdf_id = sdf_id
+            visId = p.createVisualShape(p.GEOM_MESH, fileName=fn)
+            sdf_id = p.createMultiBody(0, baseVisualShapeIndex=visId, basePosition=[0, 0, 0])
+            if prev_sdf_id is not None:
+                p.removeBody(prev_sdf_id)
+
+            # time.sleep(0.1)
+
+            # # first plot the points
+            # from base_experiments.env.pybullet_env import DebugDrawer
+            # vis = DebugDrawer(1., 1.5)
+            # vis.toggle_3d(True)
+            #
+            # vis.draw_points("sdf", pts.cpu().numpy(), color=sdf_color[:, :3])
 
 
 def test_batch_over_configurations():
@@ -139,29 +225,29 @@ def test_batch_over_configurations():
 
 
 def test_bounding_box():
-    urdf = "kuka_iiwa/model.urdf"
-    search_path = pybullet_data.getDataPath()
-    full_urdf = os.path.join(search_path, urdf)
-    chain = pk.build_serial_chain_from_urdf(open(full_urdf).read(), "lbr_iiwa_link_7")
-    d = "cuda" if torch.cuda.is_available() else "cpu"
-
-    chain = chain.to(device=d)
-    # use MeshSDF or CachedSDF for much faster lookup
-    s = pv.RobotSDF(chain, path_prefix=os.path.join(search_path, "kuka_iiwa"), )
-    th = torch.tensor([0.0, -math.pi / 4.0, 0.0, math.pi / 2.0, 0.0, math.pi / 4.0, 0.0], device=d)
-
-    s.set_joint_configuration(th)
-
-    # toggles - g:GUI w:wireframe j:joint axis a:AABB i:interrupt
-    p.connect(p.GUI if visualize else p.DIRECT)
-    p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0)
-    p.setAdditionalSearchPath(search_path)
-    armId = p.loadURDF(urdf, [0, 0, 0], useFixedBase=True)
-    # p.resetBasePositionAndOrientation(armId, [0, 0, 0], [0, 0, 0, 1])
-    for i, q in enumerate(th):
-        p.resetJointState(armId, i, q.item())
-
     if visualize:
+        urdf = "kuka_iiwa/model.urdf"
+        search_path = pybullet_data.getDataPath()
+        full_urdf = os.path.join(search_path, urdf)
+        chain = pk.build_serial_chain_from_urdf(open(full_urdf).read(), "lbr_iiwa_link_7")
+        d = "cuda" if torch.cuda.is_available() else "cpu"
+
+        chain = chain.to(device=d)
+        # use MeshSDF or CachedSDF for much faster lookup
+        s = pv.RobotSDF(chain, path_prefix=os.path.join(search_path, "kuka_iiwa"), )
+        th = torch.tensor([0.0, -math.pi / 4.0, 0.0, math.pi / 2.0, 0.0, math.pi / 4.0, 0.0], device=d)
+
+        s.set_joint_configuration(th)
+
+        # toggles - g:GUI w:wireframe j:joint axis a:AABB i:interrupt
+        p.connect(p.GUI if visualize else p.DIRECT)
+        p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0)
+        p.setAdditionalSearchPath(search_path)
+        armId = p.loadURDF(urdf, [0, 0, 0], useFixedBase=True)
+        # p.resetBasePositionAndOrientation(armId, [0, 0, 0], [0, 0, 0, 1])
+        for i, q in enumerate(th):
+            p.resetJointState(armId, i, q.item())
+
         try:
             from base_experiments.env.env import draw_ordered_end_points, draw_AABB
             from base_experiments.env.pybullet_env import DebugDrawer
@@ -183,7 +269,7 @@ def test_bounding_box():
             print(e)
 
         time.sleep(1)
-    p.disconnect()
+        p.disconnect()
 
 
 def test_single_link_robot():
@@ -254,6 +340,6 @@ def test_single_link_robot():
 
 if __name__ == "__main__":
     test_urdf_to_sdf()
-    test_batch_over_configurations()
-    test_bounding_box()
-    test_single_link_robot()
+    # test_batch_over_configurations()
+    # test_bounding_box()
+    # test_single_link_robot()
