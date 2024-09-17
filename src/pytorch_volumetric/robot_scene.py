@@ -607,15 +607,34 @@ class RobotScene:
             rvals['contact_hessian'] = torch.sum(h[:, :, None, None, None] * rob_hessian, dim=1)  # B x 3 x 14 x 14
 
             # get contact normals
-            rvals['contact_normal'] = torch.sum(sdf_grad_world_frame, dim=1)
-            rvals['contact_normal'] = rvals['contact_normal'] / torch.norm(rvals['contact_normal'], dim=1, keepdim=True)
+            contact_normal = torch.sum(sdf_grad_world_frame, dim=1)
+            norm = torch.norm(contact_normal, dim=1, keepdim=True)
+            contact_normal = contact_normal / norm
+            rvals['contact_normal'] = contact_normal
+            # rvals['contact_normal'] = torch.sum(sdf_grad_world_frame, dim=1)
+            # rvals['contact_normal'] = rvals['contact_normal'] / torch.norm(rvals['contact_normal'], dim=1, keepdim=True)
 
             closest_sdf_hess = sdf_hess.reshape(BN, -1, 3, 3)[B_range, closest_indices]
             sdf_weighted_hess = h[:, :, None, None] * closest_sdf_hess
             sdf_hess_world_frame = self.scene_transform.transform_shape_operator(
                 sdf_weighted_hess.reshape(-1, 3, 3)).reshape(BN, self.grad_smooth_points, 3, 3)
 
-            rvals['dnormal_dq'] = torch.sum(sdf_hess_world_frame @ rob_jacobian, dim=1)
+            # grad of normal normalization
+            n_xx = (torch.pow(contact_normal[:, 1], 2) + torch.pow(contact_normal[:, 2], 2)) / torch.pow(norm, 3).squeeze(-1)
+            n_xy = -contact_normal[:, 0] * contact_normal[:, 1] / torch.pow(norm, 3).squeeze(-1)
+            n_xz = -contact_normal[:, 0] * contact_normal[:, 2] / torch.pow(norm, 3).squeeze(-1)
+            n_yx = -contact_normal[:, 1] * contact_normal[:, 0] / torch.pow(norm, 3).squeeze(-1)
+            n_yy = (torch.pow(contact_normal[:, 0], 2) + torch.pow(contact_normal[:, 2], 2)) / torch.pow(norm, 3).squeeze(-1)
+            n_yz = -contact_normal[:, 1] * contact_normal[:, 2] / torch.pow(norm, 3).squeeze(-1)
+            n_zx = -contact_normal[:, 2] * contact_normal[:, 0] / torch.pow(norm, 3).squeeze(-1)
+            n_zy = -contact_normal[:, 2] * contact_normal[:, 1] / torch.pow(norm, 3).squeeze(-1)
+            n_zz = (torch.pow(contact_normal[:, 0], 2) + torch.pow(contact_normal[:, 1], 2)) / torch.pow(norm, 3).squeeze(-1)
+            n_x = torch.stack([n_xx, n_xy, n_xz], dim=-1)
+            n_y = torch.stack([n_yx, n_yy, n_yz], dim=-1)
+            n_z = torch.stack([n_zx, n_zy, n_zz], dim=-1)
+            n_grad = torch.stack([n_x, n_y, n_z], dim=-1)
+            # rvals['dnormal_dq'] = torch.sum(sdf_hess_world_frame @ rob_jacobian, dim=1)
+            rvals['dnormal_dq'] = n_grad @ torch.sum(sdf_hess_world_frame @ rob_jacobian, dim=1)
 
             # get contact normal in scene frame
             contact_normal_scene = torch.sum(sdf_weighted_grad, dim=1)
