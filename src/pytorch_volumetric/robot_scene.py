@@ -176,6 +176,10 @@ class RobotScene:
         scene_transform = self.scene_transform.get_matrix().cpu().numpy().astype(np.float64).reshape((4, 4))
         scene_meshes = [mesh.transform(scene_transform) for mesh in scene_meshes]
         colors = np.array([
+            # [0.651, 0.208, 0.290],
+            # [0.5, 0.5, 0.5],
+            # [.8, 0.1, 0.1],
+            # [.8, .8, 0.],
             [0.651, 0.208, 0.290],
             [0.121, 0.470, 0.705],
         ])
@@ -183,7 +187,8 @@ class RobotScene:
             scene_mesh.paint_uniform_color(c)
         # scene_mesh = self.scene_sdf.obj_factory._mesh.transform(self.scene_transform.get_matrix()[0].cpu().numpy())
         # return pv.get_transformed_meshes(self.robot_sdf) + [pcd] + scene_meshes
-        return pv.get_transformed_meshes(self.robot_sdf), [pcd] + scene_meshes
+        # return pv.get_transformed_meshes(self.robot_sdf), [pcd] + scene_meshes
+        return pv.get_transformed_meshes(self.robot_sdf), scene_meshes
 
     def visualize_robot(self, q: torch.Tensor, env_q: torch.Tensor = None):
         meshes = self.get_visualization_meshes(q, env_q)
@@ -217,6 +222,7 @@ class RobotScene:
         return tfs.transform_points(pts.reshape(1, -1, 3))
 
     def _transform_world_to_scene(self, pts: torch.Tensor):
+        # print('device2', self.scene_transform.device, pts.device)
         return self.scene_transform.inverse().transform_points(pts)
 
     def _transform_points(self, q: torch.Tensor, weight=None):
@@ -256,7 +262,7 @@ class RobotScene:
         sdf_result = sdf(pts, return_extra_info=True)
         sdf_vals = sdf_result['sdf_val']
         sdf_grads = sdf_result['sdf_grad']
-        sdf_hess = sdf_result['sdf_hess']
+        sdf_hess = sdf_result['sdf_hess'] if compute_hessian else None
         if sdf_hess is not None:
             sdf_hess = sdf_hess.reshape(B, -1, 3, 3)
 
@@ -354,12 +360,14 @@ class RobotScene:
                 rvals['contact_normal'] = torch.sum(sdf_grad_world_frame, dim=1)
                 rvals['contact_normal'] = rvals['contact_normal'] / torch.norm(rvals['contact_normal'], dim=1, keepdim=True)
 
-                closest_sdf_hess = sdf_hess[B_range, closest_indices]
-                sdf_weighted_hess = h[:, :, None, None] * closest_sdf_hess
-                sdf_hess_world_frame = self.scene_transform.transform_shape_operator(
-                    sdf_weighted_hess.reshape(-1, 3, 3)).reshape(B, self.grad_smooth_points, 3, 3)
+                # Only compute hessian-related computations if we need them
+                if compute_hessian and sdf_hess is not None:
+                    closest_sdf_hess = sdf_hess[B_range, closest_indices]
+                    sdf_weighted_hess = h[:, :, None, None] * closest_sdf_hess
+                    sdf_hess_world_frame = self.scene_transform.transform_shape_operator(
+                        sdf_weighted_hess.reshape(-1, 3, 3)).reshape(B, self.grad_smooth_points, 3, 3)
 
-                rvals['dnormal_dq'] = torch.sum(sdf_hess_world_frame @ pts_jacobian, dim=1)
+                    rvals['dnormal_dq'] = torch.sum(sdf_hess_world_frame @ pts_jacobian, dim=1)
 
 
             else:
@@ -370,7 +378,7 @@ class RobotScene:
                 q_grad = (pts_jacobian.transpose(1, 2) @ sdf_weighted_grad.unsqueeze(-1)).squeeze(-1)
                 rvals['grad_sdf'] = q_grad  # B x 14
 
-            if compute_hessian:
+            if compute_hessian and sdf_hess is not None:
                 closest_sdf_hess = sdf_hess[B_range, closest_indices]
                 sdf_weighted_hess = h[:, :, None, None] * closest_sdf_hess
                 if pts_hessian is None:
@@ -411,13 +419,14 @@ class RobotScene:
         sdf_result = sdf(pts, return_extra_info=True)
         sdf_vals = sdf_result['sdf_val']
         sdf_grads = sdf_result['sdf_grad']
-        sdf_hess = sdf_result['sdf_hess']
+        sdf_hess = sdf_result['sdf_hess'] if compute_hessian else None
         # get the index for the closest frame in the environment robotSDF
         sdf_closest_link = sdf_result['closest_sdf']
         sdf_frame_indices = sdf.sdf_index_to_frame_index[sdf_closest_link]
         sdf_frame_indices = sdf_frame_indices.reshape(B, -1)
 
-        sdf_hess = sdf_hess.reshape(B, -1, 3, 3)
+        if sdf_hess is not None:
+            sdf_hess = sdf_hess.reshape(B, -1, 3, 3)
 
         # get minimum links
         sdf_vals = sdf_vals.reshape(B, -1)
@@ -456,21 +465,30 @@ class RobotScene:
                                                                                             -1)
             closest_env_links = sdf_frame_indices[B_range, closest_indices].reshape(-1)
 
-            # now need hessian always
-            rob_jacobian, rob_hessian = self.robot_sdf.chain.jacobian_and_hessian(q_repeat,
-                                                                                  locations=closest_pts_link,
-                                                                                  link_indices=closest_links)
+            # Only compute hessian if we need it
+            if compute_hessian:
+                rob_jacobian, rob_hessian = self.robot_sdf.chain.jacobian_and_hessian(q_repeat,
+                                                                                      locations=closest_pts_link,
+                                                                                      link_indices=closest_links)
+                rob_hessian = rob_hessian[:, :3].reshape(B, self.grad_smooth_points, 3, q.shape[1], q.shape[1])
 
-            # want closest
-            env_jacobian, env_hessian = self.scene_sdf.chain.jacobian_and_hessian(env_q_repeat,
-                                                                                  locations=closest_pts_scene,
-                                                                                  link_indices=closest_env_links,
-                                                                                  locations_in_ee_frame=False)
+                # want closest
+                env_jacobian, env_hessian = self.scene_sdf.chain.jacobian_and_hessian(env_q_repeat,
+                                                                                      locations=closest_pts_scene,
+                                                                                      link_indices=closest_env_links,
+                                                                                      locations_in_ee_frame=False)
+                env_hessian = env_hessian[:, :3].reshape(B, self.grad_smooth_points, 3, env_q.shape[1], env_q.shape[1])
+            else:
+                rob_jacobian = self.robot_sdf.chain.jacobian(q_repeat,
+                                                            locations=closest_pts_link,
+                                                            link_indices=closest_links)
+                env_jacobian = self.scene_sdf.chain.jacobian(env_q_repeat,
+                                                            locations=closest_pts_scene,
+                                                            link_indices=closest_env_links,
+                                                            locations_in_ee_frame=False)
+
             # rotation jacobian for environment
             env_rot_jacobian = env_jacobian[:, 3:].reshape(B, self.grad_smooth_points, 3, -1)
-
-            rob_hessian = rob_hessian[:, :3].reshape(B, self.grad_smooth_points, 3, q.shape[1], q.shape[1])
-            env_hessian = env_hessian[:, :3].reshape(B, self.grad_smooth_points, 3, env_q.shape[1], env_q.shape[1])
 
             rob_jacobian = rob_jacobian[:, :3].reshape(B, self.grad_smooth_points, 3, -1)
             env_jacobian = env_jacobian[:, :3].reshape(B, self.grad_smooth_points, 3, -1)
@@ -513,41 +531,45 @@ class RobotScene:
             ## alternative to doing this, we instead recompute contact jacobian and hessian at the closest point?
             rvals['contact_jacobian'] = torch.sum(h[:, :, None, None] * rob_jacobian, dim=1)  # B x 3 x 16
             ## now want to get the contact hessian dJ/dq
-            rvals['contact_hessian'] = torch.sum(h[:, :, None, None, None] * rob_hessian, dim=1)  # B x 3 x 14 x 14
+            if compute_hessian:
+                rvals['contact_hessian'] = torch.sum(h[:, :, None, None, None] * rob_hessian, dim=1)  # B x 3 x 14 x 14
 
             # get contact normals
             rvals['contact_normal'] = torch.sum(sdf_grad_world_frame, dim=1)
             rvals['contact_normal'] = rvals['contact_normal'] / torch.norm(rvals['contact_normal'], dim=1, keepdim=True)
 
-            closest_sdf_hess = sdf_hess[B_range, closest_indices]
-            sdf_weighted_hess = h[:, :, None, None] * closest_sdf_hess
-            sdf_hess_world_frame = self.scene_transform.transform_shape_operator(
-                sdf_weighted_hess.reshape(-1, 3, 3)).reshape(B, self.grad_smooth_points, 3, 3)
+            # Only compute hessian-related computations if we need them
+            if compute_hessian and sdf_hess is not None:
+                closest_sdf_hess = sdf_hess[B_range, closest_indices]
+                sdf_weighted_hess = h[:, :, None, None] * closest_sdf_hess
+                sdf_hess_world_frame = self.scene_transform.transform_shape_operator(
+                    sdf_weighted_hess.reshape(-1, 3, 3)).reshape(B, self.grad_smooth_points, 3, 3)
 
-            rvals['dnormal_dq'] = torch.sum(sdf_hess_world_frame @ rob_jacobian, dim=1)
+                rvals['dnormal_dq'] = torch.sum(sdf_hess_world_frame @ rob_jacobian, dim=1)
 
-            # get contact normal in scene frame
-            contact_normal_scene = torch.sum(sdf_weighted_grad, dim=1)
-            contact_normal_scene = contact_normal_scene / torch.linalg.norm(contact_normal_scene, dim=-1, keepdim=True)
+                # get contact normal in scene frame
+                contact_normal_scene = torch.sum(sdf_weighted_grad, dim=1)
+                contact_normal_scene = contact_normal_scene / torch.linalg.norm(contact_normal_scene, dim=-1, keepdim=True)
 
-            rvals['env_rot_jacobian'] = torch.sum(h[:, :, None, None] * env_rot_jacobian, dim=1)
-            dnormal_denv_q_rigid = torch.cross(contact_normal_scene.reshape(-1, 1, 3),
-                                               rvals['env_rot_jacobian'].transpose(2, 1), dim=-1).transpose(1, 2)
+                rvals['env_rot_jacobian'] = torch.sum(h[:, :, None, None] * env_rot_jacobian, dim=1)
 
-            # this is the gradient of the contact normal in the scene frame, need it in robot frame
-            dnormal_denv_q = torch.sum(sdf_weighted_hess @ env_jacobian, dim=1) + dnormal_denv_q_rigid
-            rvals['dnormal_denv_q'] = self.scene_transform.transform_normals(
-                dnormal_denv_q.transpose(1, 2).reshape(-1, 3)
-            ).reshape(B, -1, 3).transpose(1, 2)
+                dnormal_denv_q_rigid = torch.cross(contact_normal_scene.reshape(-1, 1, 3),
+                                                   rvals['env_rot_jacobian'].transpose(2, 1), dim=-1).transpose(1, 2)
 
-            q_hess = torch.sum(rob_hessian * sdf_grad_world_frame.reshape(B, -1, 3, 1, 1), dim=2)
-            q_hess2 = rob_jacobian.transpose(2, 3) @ sdf_hess_world_frame @ rob_jacobian
-            q_hess = q_hess + q_hess2
-            rvals['hess_sdf'] = torch.sum(q_hess, dim=1)
-            q_env_hess = torch.sum(env_hessian * -sdf_weighted_grad.reshape(B, -1, 3, 1, 1), dim=2)
-            q_env_hess2 = env_jacobian.transpose(2, 3) @ -sdf_weighted_hess @ env_jacobian
-            q_env_hess = q_env_hess + q_env_hess2
-            rvals['hess_env_sdf'] = torch.sum(q_env_hess, dim=1)
+                # this is the gradient of the contact normal in the scene frame, need it in robot frame
+                dnormal_denv_q = torch.sum(sdf_weighted_hess @ env_jacobian, dim=1) + dnormal_denv_q_rigid
+                rvals['dnormal_denv_q'] = self.scene_transform.transform_normals(
+                    dnormal_denv_q.transpose(1, 2).reshape(-1, 3)
+                ).reshape(B, -1, 3).transpose(1, 2)
+
+                q_hess = torch.sum(rob_hessian * sdf_grad_world_frame.reshape(B, -1, 3, 1, 1), dim=2)
+                q_hess2 = rob_jacobian.transpose(2, 3) @ sdf_hess_world_frame @ rob_jacobian
+                q_hess = q_hess + q_hess2
+                rvals['hess_sdf'] = torch.sum(q_hess, dim=1)
+                q_env_hess = torch.sum(env_hessian * -sdf_weighted_grad.reshape(B, -1, 3, 1, 1), dim=2)
+                q_env_hess2 = env_jacobian.transpose(2, 3) @ -sdf_weighted_hess @ env_jacobian
+                q_env_hess = q_env_hess + q_env_hess2
+                rvals['hess_env_sdf'] = torch.sum(q_env_hess, dim=1)
 
         return rvals
 
@@ -555,7 +577,8 @@ class RobotScene:
                                                     sdf: model_to_sdf.RobotSDF, compute_gradient=False,
                                                     compute_hessian=False,
                                                     compute_closest_obj_point=False,
-                                                    rob_link_idx=None):
+                                                    rob_link_idx=None,
+                                                    contact_constraint_only=False):
         # This is a function for collision checking when the environment is itself a RobotSDF, i.e. it is
         # an articulated SDF with configuration env_q, vs the robot which has configuration rob_q
         # Add leading batch dimension
@@ -569,21 +592,26 @@ class RobotScene:
         if compute_hessian and not compute_gradient:
             raise ValueError('Cannot compute hessian without gradient')
 
+        # Only compute hessian if both conditions are met
+        should_compute_hessian = compute_hessian or (not contact_constraint_only)
+
         # set the configuration of the scene
         sdf.set_joint_configuration(env_q)
         pts_world = self.transform_to_world(q)
         pts = self.transform_world_to_scene(pts_world)
         robot_frame_indices = self.desired_frame_idx[None, :, None].repeat(B, 1, self.points_per_link).reshape(B, num_fingers, -1)
-        sdf_result = sdf(pts, return_extra_info=True)
+        sdf_result = sdf(pts, return_extra_info=True, compute_hessian=should_compute_hessian)
         sdf_vals = sdf_result['sdf_val']
         sdf_grads = sdf_result['sdf_grad']
-        sdf_hess = sdf_result['sdf_hess']
+        sdf_hess = sdf_result['sdf_hess'] if should_compute_hessian else None
 
         # get the index for the closest frame in the environment robotSDF
         sdf_closest_link = sdf_result['closest_sdf']
         sdf_frame_indices = sdf.sdf_index_to_frame_index[sdf_closest_link]
         sdf_frame_indices = sdf_frame_indices.reshape(B, num_fingers, -1)
-        sdf_hess = sdf_hess.reshape(B, num_fingers, -1, 3, 3)
+        
+        if sdf_hess is not None:
+            sdf_hess = sdf_hess.reshape(B, num_fingers, -1, 3, 3)
 
         # get minimum links
         sdf_vals = sdf_vals.reshape(B, num_fingers, -1)
@@ -632,21 +660,34 @@ class RobotScene:
 
             closest_env_links = sdf_frame_indices.reshape(BN, -1)[B_range, closest_indices].reshape(-1)
 
-            # now need hessian always
-            rob_jacobian, rob_hessian = self.robot_sdf.chain.jacobian_and_hessian(q_repeat,
-                                                                                  locations=closest_pts_link,
-                                                                                  link_indices=closest_links)
-
             # want closest
-            env_jacobian, env_hessian = self.scene_sdf.chain.jacobian_and_hessian(env_q_repeat,
-                                                                                  locations=closest_pts_scene,
-                                                                                  link_indices=closest_env_links,
-                                                                                  locations_in_ee_frame=False)
+            # Only compute robot hessian if we need it
+            # if should_compute_hessian:
+            rob_jacobian, rob_hessian = self.robot_sdf.chain.jacobian_and_hessian(q_repeat,
+                                                                                locations=closest_pts_link,
+                                                                                link_indices=closest_links)
+            rob_hessian = rob_hessian[:, :3].reshape(BN, self.grad_smooth_points, 3, q.shape[1], q.shape[1])
+            # else:
+            #     rob_jacobian = self.robot_sdf.chain.jacobian(q_repeat,
+            #                                                 locations=closest_pts_link,
+            #                                                 link_indices=closest_links)
+
+            # Only compute environment hessian if we need it
+            if should_compute_hessian:
+                env_jacobian, env_hessian = self.scene_sdf.chain.jacobian_and_hessian(env_q_repeat,
+                                                                                    locations=closest_pts_scene,
+                                                                                    link_indices=closest_env_links,
+                                                                                    locations_in_ee_frame=False)
+                env_hessian = env_hessian[:, :3].reshape(BN, self.grad_smooth_points, 3, env_q.shape[1], env_q.shape[1])
+            else:
+                env_jacobian = self.scene_sdf.chain.jacobian(env_q_repeat,
+                                                            locations=closest_pts_scene,
+                                                            link_indices=closest_env_links,
+                                                            locations_in_ee_frame=False)
+
             # rotation jacobian for environment
             env_rot_jacobian = env_jacobian[:, 3:].reshape(BN, self.grad_smooth_points, 3, -1)
 
-            rob_hessian = rob_hessian[:, :3].reshape(BN, self.grad_smooth_points, 3, q.shape[1], q.shape[1])
-            env_hessian = env_hessian[:, :3].reshape(BN, self.grad_smooth_points, 3, env_q.shape[1], env_q.shape[1])
 
             rob_jacobian = rob_jacobian[:, :3].reshape(BN, self.grad_smooth_points, 3, -1)
             env_jacobian = env_jacobian[:, :3].reshape(BN, self.grad_smooth_points, 3, -1)
@@ -683,10 +724,11 @@ class RobotScene:
 
             rvals['grad_sdf'] = torch.sum(q_grad, dim=1)  # B x 14
             rvals['grad_env_sdf'] = torch.sum(q_env_grad, dim=1)  # B x 14
-            rvals['closest_pt_world'] = torch.sum(h[:, :, None] * closest_pts_world, dim=1)  # B x 3
+            
+ 
+                # if 'cross' in self.obj_link_name:
             rvals['closest_rob_pt_scene'] = torch.sum(h[:, :, None] * closest_pts_scene.reshape(closest_pts_world.shape), dim=1)  # B x 3
-
-
+            
             rvals['closest_pt_q_grad'] = dclosest_dq  # B x 3 x 14
             rvals['closest_pt_env_q_grad'] = dclosest_denv_q
             # Transform dclosest_dq to the scene frame
@@ -710,7 +752,6 @@ class RobotScene:
             object_trans = pk.Transform3d(matrix=object_trans_mat)
 
             # Convert from scene frame to object frame
-            rvals['closest_rob_pt_object'] = object_trans.transform_points(rvals['closest_rob_pt_scene'].unsqueeze(1)).squeeze(1)
             rvals['closest_pt_q_grad_object'] = object_trans.transform_normals(
                 rvals['closest_pt_q_grad_scene'].transpose(1, 2)
             ).reshape(BN, -1, 3).transpose(1, 2)
@@ -720,102 +761,176 @@ class RobotScene:
 
             if self.obj_link_name == 'screwdriver_body':
                 rvals['closest_pt_env_q_grad_object'][..., -2:] = 0.0
+
+            rvals['closest_rob_pt_object'] = object_trans.transform_points(rvals['closest_rob_pt_scene'].unsqueeze(1)).squeeze(1)
+
             if compute_closest_obj_point:
                 return_frame = 1 if 'cross' in self.obj_link_name else None
                 input_ = rvals['closest_rob_pt_object']
                 if 'cross' in self.obj_link_name:
                     input_ = rvals['closest_rob_pt_scene']
                 res = sdf.object_frame_closest_point(input_, return_frame=return_frame)
-                rvals['closest_obj_pt_object'] = res.closest     
-                # if 'cross' in self.obj_link_name:
+                rvals['closest_obj_pt_object'] = res.closest    
+            rvals['closest_pt_world'] = torch.sum(h[:, :, None] * closest_pts_world, dim=1)  # B x 3
+            if not contact_constraint_only:
 
 
-            if compute_closest_obj_point or rob_link_idx is not None:
-                
-                if compute_closest_obj_point:
-                    rvals['closest_pt_closest_link'] = closest_links_not_flat[..., 0].flatten()
-                    closest_pt_link_tfs = self.get_specific_tfs(rvals['closest_pt_closest_link'].unsqueeze(0)).squeeze(0)
-                else:
-                    closest_pt_link_tfs = self.get_specific_tfs(rob_link_idx.unsqueeze(0)).reshape(BN, 4, 4)
-                closest_pt_link_tfs = pk.Transform3d(matrix=closest_pt_link_tfs)
-                rvals['closest_rob_pt_link'] = closest_pt_link_tfs.transform_points(
-                    rvals['closest_pt_world'].reshape(BN, -1, 3)
-                ).reshape(BN, 3)  # B x 3
 
-                rvals['closest_pt_q_grad_link'] = closest_pt_link_tfs.transform_normals(
-                    dclosest_dq.transpose(1, 2)
-                ).reshape(BN, -1, 3).transpose(1, 2)
-                rvals['closest_pt_env_q_grad_link'] = closest_pt_link_tfs.transform_normals(
-                    dclosest_denv_q.transpose(1, 2)
-                ).reshape(BN, -1, 3).transpose(1, 2)
+                if compute_closest_obj_point or rob_link_idx is not None:
+                    
+                    if compute_closest_obj_point:
+                        rvals['closest_pt_closest_link'] = closest_links_not_flat[..., 0].flatten()
+                        closest_pt_link_tfs = self.get_specific_tfs(rvals['closest_pt_closest_link'].unsqueeze(0)).squeeze(0)
+                    else:
+                        closest_pt_link_tfs = self.get_specific_tfs(rob_link_idx.unsqueeze(0)).reshape(BN, 4, 4)
+                    closest_pt_link_tfs = pk.Transform3d(matrix=closest_pt_link_tfs)
+                    rvals['closest_rob_pt_link'] = closest_pt_link_tfs.transform_points(
+                        rvals['closest_pt_world'].reshape(BN, -1, 3)
+                    ).reshape(BN, 3)  # B x 3
 
-            ## alternative to doing this, we instead recompute contact jacobian and hessian at the closest point?
+                    rvals['closest_pt_q_grad_link'] = closest_pt_link_tfs.transform_normals(
+                        dclosest_dq.transpose(1, 2)
+                    ).reshape(BN, -1, 3).transpose(1, 2)
+                    rvals['closest_pt_env_q_grad_link'] = closest_pt_link_tfs.transform_normals(
+                        dclosest_denv_q.transpose(1, 2)
+                    ).reshape(BN, -1, 3).transpose(1, 2)
+
+            # Only compute contact hessian if we need it
             rvals['contact_jacobian'] = torch.sum(h[:, :, None, None] * rob_jacobian, dim=1)  # B x 3 x 16
-            ## now want to get the contact hessian dJ/dq
+            # if should_compute_hessian:
             rvals['contact_hessian'] = torch.sum(h[:, :, None, None, None] * rob_hessian, dim=1)  # B x 3 x 14 x 14
 
-            # get contact normals
-            contact_normal = torch.sum(sdf_grad_world_frame, dim=1)
-            norm = torch.norm(contact_normal, dim=1, keepdim=True)
-            contact_normal = contact_normal / norm
-            rvals['contact_normal'] = contact_normal
-            # rvals['contact_normal'] = torch.sum(sdf_grad_world_frame, dim=1)
-            # rvals['contact_normal'] = rvals['contact_normal'] / torch.norm(rvals['contact_normal'], dim=1, keepdim=True)
 
-            closest_sdf_hess = sdf_hess.reshape(BN, -1, 3, 3)[B_range, closest_indices]
-            sdf_weighted_hess = h[:, :, None, None] * closest_sdf_hess
-            sdf_hess_world_frame = self.scene_transform.transform_shape_operator(
-                sdf_weighted_hess.reshape(-1, 3, 3)).reshape(BN, self.grad_smooth_points, 3, 3)
 
-            # grad of normal normalization
-            n_xx = (torch.pow(contact_normal[:, 1], 2) + torch.pow(contact_normal[:, 2], 2)) / torch.pow(norm, 3).squeeze(-1)
-            n_xy = -contact_normal[:, 0] * contact_normal[:, 1] / torch.pow(norm, 3).squeeze(-1)
-            n_xz = -contact_normal[:, 0] * contact_normal[:, 2] / torch.pow(norm, 3).squeeze(-1)
-            n_yx = -contact_normal[:, 1] * contact_normal[:, 0] / torch.pow(norm, 3).squeeze(-1)
-            n_yy = (torch.pow(contact_normal[:, 0], 2) + torch.pow(contact_normal[:, 2], 2)) / torch.pow(norm, 3).squeeze(-1)
-            n_yz = -contact_normal[:, 1] * contact_normal[:, 2] / torch.pow(norm, 3).squeeze(-1)
-            n_zx = -contact_normal[:, 2] * contact_normal[:, 0] / torch.pow(norm, 3).squeeze(-1)
-            n_zy = -contact_normal[:, 2] * contact_normal[:, 1] / torch.pow(norm, 3).squeeze(-1)
-            n_zz = (torch.pow(contact_normal[:, 0], 2) + torch.pow(contact_normal[:, 1], 2)) / torch.pow(norm, 3).squeeze(-1)
-            n_x = torch.stack([n_xx, n_xy, n_xz], dim=-1)
-            n_y = torch.stack([n_yx, n_yy, n_yz], dim=-1)
-            n_z = torch.stack([n_zx, n_zy, n_zz], dim=-1)
-            n_grad = torch.stack([n_x, n_y, n_z], dim=-1)
-            # rvals['dnormal_dq'] = torch.sum(sdf_hess_world_frame @ rob_jacobian, dim=1)
-            rvals['dnormal_dq'] = n_grad @ torch.sum(sdf_hess_world_frame @ rob_jacobian, dim=1)
+            # Only compute hessian-related computations if we need them
+            if should_compute_hessian and sdf_hess is not None:
+                # get contact normals
+                contact_normal = torch.sum(sdf_grad_world_frame, dim=1)
+                norm = torch.norm(contact_normal, dim=1, keepdim=True)
+                contact_normal = contact_normal / norm
+                rvals['contact_normal'] = contact_normal
+                closest_sdf_hess = sdf_hess.reshape(BN, -1, 3, 3)[B_range, closest_indices]
+                sdf_weighted_hess = h[:, :, None, None] * closest_sdf_hess
+                sdf_hess_world_frame = self.scene_transform.transform_shape_operator(
+                    sdf_weighted_hess.reshape(-1, 3, 3)).reshape(BN, self.grad_smooth_points, 3, 3)
 
-            # get contact normal in scene frame
-            contact_normal_scene = torch.sum(sdf_weighted_grad, dim=1)
-            contact_normal_scene = contact_normal_scene / torch.linalg.norm(contact_normal_scene, dim=-1, keepdim=True)
+                # grad of normal normalization
+                n_xx = (torch.pow(contact_normal[:, 1], 2) + torch.pow(contact_normal[:, 2], 2)) / torch.pow(norm, 3).squeeze(-1)
+                n_xy = -contact_normal[:, 0] * contact_normal[:, 1] / torch.pow(norm, 3).squeeze(-1)
+                n_xz = -contact_normal[:, 0] * contact_normal[:, 2] / torch.pow(norm, 3).squeeze(-1)
+                n_yx = -contact_normal[:, 1] * contact_normal[:, 0] / torch.pow(norm, 3).squeeze(-1)
+                n_yy = (torch.pow(contact_normal[:, 0], 2) + torch.pow(contact_normal[:, 2], 2)) / torch.pow(norm, 3).squeeze(-1)
+                n_yz = -contact_normal[:, 1] * contact_normal[:, 2] / torch.pow(norm, 3).squeeze(-1)
+                n_zx = -contact_normal[:, 2] * contact_normal[:, 0] / torch.pow(norm, 3).squeeze(-1)
+                n_zy = -contact_normal[:, 2] * contact_normal[:, 1] / torch.pow(norm, 3).squeeze(-1)
+                n_zz = (torch.pow(contact_normal[:, 0], 2) + torch.pow(contact_normal[:, 1], 2)) / torch.pow(norm, 3).squeeze(-1)
+                n_x = torch.stack([n_xx, n_xy, n_xz], dim=-1)
+                n_y = torch.stack([n_yx, n_yy, n_yz], dim=-1)
+                n_z = torch.stack([n_zx, n_zy, n_zz], dim=-1)
+                n_grad = torch.stack([n_x, n_y, n_z], dim=-1)
+                rvals['dnormal_dq'] = n_grad @ torch.sum(sdf_hess_world_frame @ rob_jacobian, dim=1)
 
-            rvals['env_rot_jacobian'] = torch.sum(h[:, :, None, None] * env_rot_jacobian, dim=1)
+                # get contact normal in scene frame
+                contact_normal_scene = torch.sum(sdf_weighted_grad, dim=1)
+                contact_normal_scene = contact_normal_scene / torch.linalg.norm(contact_normal_scene, dim=-1, keepdim=True)
 
-            dnormal_denv_q_rigid = torch.cross(contact_normal_scene.reshape(-1, 1, 3),
-                                               rvals['env_rot_jacobian'].transpose(2, 1), dim=-1).transpose(1, 2)
+                rvals['env_rot_jacobian'] = torch.sum(h[:, :, None, None] * env_rot_jacobian, dim=1)
 
-            # this is the gradient of the contact normal in the scene frame, need it in robot frame
-            dnormal_denv_q = torch.sum(sdf_weighted_hess @ env_jacobian, dim=1) + dnormal_denv_q_rigid
+                dnormal_denv_q_rigid = torch.cross(contact_normal_scene.reshape(-1, 1, 3),
+                                                   rvals['env_rot_jacobian'].transpose(2, 1), dim=-1).transpose(1, 2)
 
-            rvals['dnormal_denv_q'] = self.scene_transform.transform_normals(
-                dnormal_denv_q.transpose(1, 2).reshape(-1, 3)
-            ).reshape(BN, -1, 3).transpose(1, 2)
+                # this is the gradient of the contact normal in the scene frame, need it in robot frame
+                dnormal_denv_q = torch.sum(sdf_weighted_hess @ env_jacobian, dim=1) + dnormal_denv_q_rigid
 
-            q_hess = torch.sum(rob_hessian * sdf_grad_world_frame.reshape(BN, -1, 3, 1, 1), dim=2)
-            q_hess2 = rob_jacobian.transpose(2, 3) @ sdf_hess_world_frame @ rob_jacobian
-            q_hess = q_hess + q_hess2
-            rvals['hess_sdf'] = torch.sum(q_hess, dim=1)
-            q_env_hess = torch.sum(env_hessian * -sdf_weighted_grad.reshape(BN, -1, 3, 1, 1), dim=2)
-            q_env_hess2 = env_jacobian.transpose(2, 3) @ -sdf_weighted_hess @ env_jacobian
-            q_env_hess = q_env_hess + q_env_hess2
+                rvals['dnormal_denv_q'] = self.scene_transform.transform_normals(
+                    dnormal_denv_q.transpose(1, 2).reshape(-1, 3)
+                ).reshape(BN, -1, 3).transpose(1, 2)
 
-            rvals['hess_env_sdf'] = torch.sum(q_env_hess, dim=1)
+                # Compute hessian terms
+                q_hess = torch.sum(rob_hessian * sdf_grad_world_frame.reshape(BN, -1, 3, 1, 1), dim=2)
+                q_hess2 = rob_jacobian.transpose(2, 3) @ sdf_hess_world_frame @ rob_jacobian
+                q_hess = q_hess + q_hess2
+                rvals['hess_sdf'] = torch.sum(q_hess, dim=1)
+                q_env_hess = torch.sum(env_hessian * -sdf_weighted_grad.reshape(BN, -1, 3, 1, 1), dim=2)
+                q_env_hess2 = env_jacobian.transpose(2, 3) @ -sdf_weighted_hess @ env_jacobian
+                q_env_hess = q_env_hess + q_env_hess2
+
+                rvals['hess_env_sdf'] = torch.sum(q_env_hess, dim=1)
 
         for key, item in rvals.items():
             rvals[key] = item.reshape(B, num_fingers, *item.shape[1:])
 
         return rvals
 
+    def _get_sdf(self, q: torch.Tensor, env_q: torch.Tensor,
+                sdf: model_to_sdf.RobotSDF, compute_gradient=False,
+                compute_hessian=False,
+                compute_closest_obj_point=False,
+                rob_link_idx=None):
+        # This is a function for collision checking when the environment is itself a RobotSDF, i.e. it is
+        # an articulated SDF with configuration env_q, vs the robot which has configuration rob_q
+        # Add leading batch dimension
+        if len(q.shape) == 1:
+            q = q.reshape(1, -1)
+            B = 1
+        else:
+            B = q.shape[0]
+        num_fingers = len(self.desired_links) // self.links_per_finger
+
+        if compute_hessian and not compute_gradient:
+            raise ValueError('Cannot compute hessian without gradient')
+
+        # set the configuration of the scene
+        sdf.set_joint_configuration(env_q)
+        pts_world = self.transform_to_world(q)
+        pts = self.transform_world_to_scene(pts_world)
+        robot_frame_indices = self.desired_frame_idx[None, :, None].repeat(B, 1, self.points_per_link).reshape(B, num_fingers, -1)
+        sdf_result = sdf(pts, return_extra_info=True)
+        sdf_vals = sdf_result['sdf_val']
+        sdf_grads = sdf_result['sdf_grad']
+        sdf_hess = sdf_result['sdf_hess'] if compute_hessian else None
+
+        # get the index for the closest frame in the environment robotSDF
+        sdf_closest_link = sdf_result['closest_sdf']
+        sdf_frame_indices = sdf.sdf_index_to_frame_index[sdf_closest_link]
+        sdf_frame_indices = sdf_frame_indices.reshape(B, num_fingers, -1)
+        if sdf_hess is not None:
+            sdf_hess = sdf_hess.reshape(B, num_fingers, -1, 3, 3)
+
+        # get minimum links
+        sdf_vals = sdf_vals.reshape(B, num_fingers, -1)
+        sdf_grads = sdf_grads.reshape(B, num_fingers, -1, 3)
+        sdf_indices = torch.argsort(sdf_vals, dim=-1, descending=False)
+        #sdf_val = sdf_vals[torch.arange(B*), torch.arange(num_fingers), sdf_indices[:, :, 0]]
+
+        sdf_val = sdf_vals.reshape(B*num_fingers, -1)[torch.arange(B*num_fingers), sdf_indices.reshape(B*num_fingers, -1)[:, 0]]
+        rvals = {
+            'sdf': sdf_val,
+        }
+        return rvals
+
     def scene_collision_check(self, q: torch.Tensor, env_q=None,
+                              compute_gradient=False, compute_hessian=False,
+                              compute_closest_obj_point=False,
+                              rob_link_idx=None,
+                              contact_constraint_only=False):
+        """
+           Collision checks robot with scene sdf
+           :param q: torch.Tensor B x dq joint angles
+           :param compute_gradient: bool whether to compute gradient of sdf wrt joint angles
+           :param compute_hessian: bool whether to compute hessian of sdf wrt joint angles
+           """
+        if isinstance(self.scene_sdf, model_to_sdf.RobotSDF):
+            if env_q is None:
+                raise ValueError('Must provide environment configuration if scene is articulated SDF')
+            return self._collision_check_against_robot_sdf_per_link(q, env_q, self.scene_sdf, compute_gradient,
+                                                                    compute_hessian,compute_closest_obj_point,
+                                                                    rob_link_idx,
+                                                                    contact_constraint_only)
+
+        return self._collision_check(q, self.scene_sdf, compute_gradient, compute_hessian, contact_constraint_only)
+    
+    def scene_get_sdf(self, q: torch.Tensor, env_q=None,
                               compute_gradient=False, compute_hessian=False,
                               compute_closest_obj_point=False,
                               rob_link_idx=None):
@@ -828,11 +943,26 @@ class RobotScene:
         if isinstance(self.scene_sdf, model_to_sdf.RobotSDF):
             if env_q is None:
                 raise ValueError('Must provide environment configuration if scene is articulated SDF')
-            return self._collision_check_against_robot_sdf_per_link(q, env_q, self.scene_sdf, compute_gradient,
+            return self._get_sdf(q, env_q, self.scene_sdf, compute_gradient,
                                                                     compute_hessian,compute_closest_obj_point,
                                                                     rob_link_idx)
-
-        return self._collision_check(q, self.scene_sdf, compute_gradient, compute_hessian)
+        else:
+            # For non-RobotSDF scene objects, create a simple wrapper
+            if len(q.shape) == 1:
+                q = q.reshape(1, -1)
+                B = 1
+            else:
+                B = q.shape[0]
+            
+            pts_world = self.transform_to_world(q)
+            pts = self.transform_world_to_scene(pts_world)
+            
+            sdf_result = self.scene_sdf(pts, return_extra_info=True)
+            sdf_vals = sdf_result['sdf_val']
+            sdf_vals = sdf_vals.reshape(B, -1)
+            sdf_val = torch.min(sdf_vals, dim=1)[0]
+            
+            return {'sdf': sdf_val}
 
     def self_collision_check(self, q: torch.Tensor, compute_gradient=False, compute_hessian=False):
         """

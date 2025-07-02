@@ -3,11 +3,20 @@ import abc
 import copy
 import math
 import typing
+import argparse
+import sys
+import threading
+import platform
+import signal
+import contextlib
+import time
+from contextlib import contextmanager
 
 from typing import NamedTuple, Union
 
 import numpy as np
 import open3d as o3d
+o3d.utility.set_verbosity_level(o3d.utility.VerbosityLevel.Debug)
 
 import torch
 from arm_pytorch_utilities import tensor_utils, rand
@@ -18,8 +27,45 @@ from pytorch_volumetric.voxel import VoxelGrid, get_divisible_range_by_resolutio
 import pytorch_kinematics as pk
 import logging
 
+import faulthandler
+faulthandler.enable()
+
 
 logger = logging.getLogger(__name__)
+# logging.getLogger('pytorch_volumetric.sdf').setLevel(logging.DEBUG)
+# Platform-specific workarounds
+PLATFORM_WORKAROUNDS = {
+    'Linux': {
+        'use_cpu_only': os.environ.get('O3D_CPU_ONLY', 'false').lower() == 'true',
+        'max_mesh_size': int(os.environ.get('O3D_MAX_MESH_SIZE', '1000000')),  # 1M triangles
+        'prefer_cuda': os.environ.get('O3D_PREFER_CUDA', 'false').lower() == 'true',
+    },
+    'Darwin': {  # macOS
+        'use_cpu_only': True,  # macOS can have GPU issues with raycasting
+        'max_mesh_size': int(os.environ.get('O3D_MAX_MESH_SIZE', '500000')),   # 500K triangles
+        'prefer_cuda': False,
+    },
+    'Windows': {
+        'use_cpu_only': os.environ.get('O3D_CPU_ONLY', 'false').lower() == 'true',
+        'max_mesh_size': int(os.environ.get('O3D_MAX_MESH_SIZE', '1000000')),
+        'prefer_cuda': os.environ.get('O3D_PREFER_CUDA', 'false').lower() == 'true',
+    }
+}
+
+CURRENT_PLATFORM = PLATFORM_WORKAROUNDS.get(platform.system(), PLATFORM_WORKAROUNDS['Linux'])
+
+
+def parse_sdf_args():
+    """Parse command line arguments for SDF configuration."""
+    parser = argparse.ArgumentParser(description='SDF computation with optional hessian')
+    parser.add_argument('--no-hessian', action='store_true', 
+                       help='Disable hessian computation for better performance')
+    
+    # Only parse if this is the main module or if args are provided
+    if len(sys.argv) > 1 and '--no-hessian' in sys.argv:
+        args, _ = parser.parse_known_args()
+        return not args.no_hessian
+    return True  # Default to computing hessian
 
 
 class SDFQuery(NamedTuple):
@@ -46,6 +92,8 @@ class ObjectFactory(abc.ABC):
         self._mesht = None
         self._raycasting_scene = None
         self._face_normals = None
+        self._precompute_lock = threading.Lock()
+        self._precomputed = False
 
     def __reduce__(self):
         return partial(self.__class__, scale=self.scale, vis_frame_pos=self.vis_frame_pos,
@@ -71,7 +119,7 @@ class ObjectFactory(abc.ABC):
                             object_id=object_id, vis_frame_pos=frame_pos, vis_frame_rot=self.vis_frame_rot)
 
     def bounding_box(self, padding=0.):
-        if self._mesh is None:
+        if not self._precomputed:
             self.precompute_sdf()
 
         aabb = self._mesh.get_axis_aligned_bounding_box()
@@ -83,32 +131,162 @@ class ObjectFactory(abc.ABC):
         ranges[:, 1] += padding
         return ranges
 
-    def precompute_sdf(self):
-        # scale mesh the appropriate amount
-        full_path = self.get_mesh_high_poly_resource_filename()
-        if not os.path.exists(full_path):
-            raise RuntimeError(f"Expected mesh file does not exist: {full_path}")
-        self._mesh = o3d.io.read_triangle_mesh(full_path)
-        # scale mesh
-        scale_transform = np.eye(4)
-        np.fill_diagonal(scale_transform[:3, :3], self.scale)
-        # Check if scale_transform is identity
-        self._mesh.transform(scale_transform)
-        # convert from mesh object frame to simulator object frame
-        x, y, z, w = self.vis_frame_rot
-        self._mesh = self._mesh.rotate(o3d.geometry.get_rotation_matrix_from_quaternion((w, x, y, z)),
-                                       center=[0, 0, 0])
-        self._mesh = self._mesh.translate(np.array(self.vis_frame_pos) * self.scale)
+    def _get_o3d_device(self):
+        """Get appropriate Open3D device based on platform and availability."""
+        if CURRENT_PLATFORM['use_cpu_only']:
+            return o3d.core.Device("CPU:0")
+        
+        # Check if CUDA is preferred and available in Open3D
+        if CURRENT_PLATFORM.get('prefer_cuda', True):
+            if hasattr(o3d.core, 'cuda') and o3d.core.cuda.device_count() > 0:
+                try:
+                    cuda_device = o3d.core.Device("CUDA:0")
+                    logger.info("Using CUDA device for Open3D raycasting operations")
+                    return cuda_device
+                except Exception as e:
+                    logger.warning(f"CUDA device requested but failed to initialize: {e}, falling back to CPU")
+            else:
+                logger.info("CUDA preferred but not available in Open3D, using CPU")
+        
+        return o3d.core.Device("CPU:0")
 
-        self._mesht = o3d.t.geometry.TriangleMesh.from_legacy(self._mesh)
-        self._raycasting_scene = o3d.t.geometry.RaycastingScene()
-        _ = self._raycasting_scene.add_triangles(self._mesht)
-        self._mesh.compute_triangle_normals()
-        self._face_normals = np.asarray(self._mesh.triangle_normals)
+    def precompute_sdf(self):
+        with self._precompute_lock:
+            # Check if already precomputed
+            if self._precomputed:
+                return
+                
+            try:
+                # Get appropriate device for Open3D operations
+                o3d_device = self._get_o3d_device()
+                logger.debug(f"Using Open3D device: {o3d_device}")
+                
+                # scale mesh the appropriate amount
+                full_path = self.get_mesh_high_poly_resource_filename()
+                if not os.path.exists(full_path):
+                    raise RuntimeError(f"Expected mesh file does not exist: {full_path}")
+                self._mesh = o3d.io.read_triangle_mesh(full_path)
+                
+                # Validate the mesh
+                if len(self._mesh.vertices) == 0 or len(self._mesh.triangles) == 0:
+                    raise RuntimeError(f"Empty mesh loaded from: {full_path}")
+                
+                # Check for invalid values
+                vertices = np.asarray(self._mesh.vertices)
+                if np.any(~np.isfinite(vertices)):
+                    raise RuntimeError(f"Mesh contains invalid vertices: {full_path}")
+                
+                # Additional validation for extreme values
+                vertex_magnitudes = np.linalg.norm(vertices, axis=1)
+                if np.any(vertex_magnitudes > 1e6):
+                    logger.warning(f"Mesh has very large coordinates (max: {np.max(vertex_magnitudes)})")
+                
+                # Remove degenerate triangles and duplicated vertices
+                self._mesh.remove_degenerate_triangles()
+                self._mesh.remove_duplicated_triangles()
+                self._mesh.remove_duplicated_vertices()
+                self._mesh.remove_non_manifold_edges()
+                
+                # Check if mesh still has valid geometry after cleaning
+                if len(self._mesh.vertices) == 0 or len(self._mesh.triangles) == 0:
+                    raise RuntimeError(f"Mesh became empty after cleaning: {full_path}")
+                
+                # Check mesh size limits
+                num_triangles = len(self._mesh.triangles)
+                max_size = CURRENT_PLATFORM['max_mesh_size']
+                if num_triangles > max_size:
+                    logger.warning(f"Mesh has {num_triangles} triangles, exceeding platform limit of {max_size}")
+                    # Simplify the mesh if it's too large
+                    target_triangles = int(max_size * 0.8)  # Leave some margin
+                    reduction_factor = target_triangles / num_triangles
+                    self._mesh = self._mesh.simplify_quadric_decimation(target_triangles)
+                    logger.info(f"Simplified mesh from {num_triangles} to {len(self._mesh.triangles)} triangles")
+                
+                # scale mesh
+                scale_transform = np.eye(4)
+                np.fill_diagonal(scale_transform[:3, :3], self.scale)
+                # Check if scale_transform is identity
+                self._mesh.transform(scale_transform)
+                # convert from mesh object frame to simulator object frame
+                x, y, z, w = self.vis_frame_rot
+                self._mesh = self._mesh.rotate(o3d.geometry.get_rotation_matrix_from_quaternion((w, x, y, z)),
+                                               center=[0, 0, 0])
+                self._mesh = self._mesh.translate(np.array(self.vis_frame_pos) * self.scale)
+
+                # Validate after transformations
+                vertices = np.asarray(self._mesh.vertices)
+                if np.any(~np.isfinite(vertices)):
+                    raise RuntimeError("Mesh transformations resulted in invalid geometry")
+                
+                # Additional check for triangle areas to catch very small triangles
+                triangles = np.asarray(self._mesh.triangles)
+                triangle_areas = self._compute_triangle_areas(vertices, triangles)
+                min_area = np.min(triangle_areas)
+                if min_area < 1e-12:
+                    logger.warning(f"Mesh has very small triangles (min area: {min_area})")
+                
+                # Try to create raycasting scene with retries
+                max_retries = 3
+                for attempt in range(max_retries):
+                    try:
+                        # Create tensor mesh on the specified device
+                        self._mesht = o3d.t.geometry.TriangleMesh.from_legacy(self._mesh, device=o3d_device)
+                        
+                        # Validate tensor mesh
+                        if self._mesht.vertex.positions.shape[0] == 0:
+                            raise RuntimeError("Tensor mesh has no vertices")
+                        
+                        # logger.debug(f"Creating RaycastingScene for mesh with {self._mesht.vertex.positions.shape[0]} vertices")
+                        # Create raycasting scene (inherits device from mesh)
+                        self._raycasting_scene = o3d.t.geometry.RaycastingScene()
+                        
+                        # This is the critical line that often causes segfaults
+                        with raycasting_operation_monitor("add_triangles"):
+                            _ = self._raycasting_scene.add_triangles(self._mesht)
+                        break
+                        
+                    except Exception as e:
+                        if attempt == max_retries - 1:
+                            raise RuntimeError(f"Failed to create raycasting scene after {max_retries} attempts: {e}")
+                        else:
+                            logger.warning(f"Attempt {attempt + 1} failed: {e}, retrying...")
+                            # Try to fix the mesh more aggressively
+                            self._mesh.remove_degenerate_triangles()
+                            self._mesh.remove_non_manifold_edges()
+
+                self._mesh.compute_triangle_normals()
+                self._face_normals = np.asarray(self._mesh.triangle_normals)
+                
+                # Mark as successfully precomputed
+                self._precomputed = True
+                
+            except Exception as e:
+                # Clean up on failure
+                self._mesh = None
+                self._mesht = None
+                self._raycasting_scene = None
+                self._face_normals = None
+                self._precomputed = False
+                raise
+
+    def _compute_triangle_areas(self, vertices, triangles):
+        """Compute areas of all triangles in the mesh."""
+        v0 = vertices[triangles[:, 0]]
+        v1 = vertices[triangles[:, 1]]
+        v2 = vertices[triangles[:, 2]]
+        
+        # Compute cross product of two edges
+        edge1 = v1 - v0
+        edge2 = v2 - v0
+        cross = np.cross(edge1, edge2)
+        
+        # Area is half the magnitude of cross product
+        areas = 0.5 * np.linalg.norm(cross, axis=1)
+        return areas
 
     @tensor_utils.handle_batch_input(n=2)
     def _do_object_frame_closest_point(self, points_in_object_frame, compute_normal=False, compute_hessian=False):
-        if self._mesh is None:
+        if not self._precomputed:
             self.precompute_sdf()
 
         if torch.is_tensor(points_in_object_frame):
@@ -120,10 +298,23 @@ class ObjectFactory(abc.ABC):
             device = "cpu"
         points_in_object_frame = points_in_object_frame.astype(np.float32)
 
-        closest = self._raycasting_scene.compute_closest_points(points_in_object_frame)
-        closest_points = closest['points']
-        face_ids = closest['primitive_ids']
-        pts = closest_points.numpy()
+        # Validate input points
+        if np.any(~np.isfinite(points_in_object_frame)):
+            raise ValueError("Input points contain invalid values (NaN or inf)")
+
+        # Convert to Open3D tensor on the same device as the mesh
+        o3d_points = o3d.core.Tensor(points_in_object_frame, device=self._mesht.device)
+
+        try:
+            with raycasting_operation_monitor(f"compute_closest_points_{points_in_object_frame.shape[0]}_points"):
+                closest = self._raycasting_scene.compute_closest_points(o3d_points)
+                closest_points = closest['points']
+                face_ids = closest['primitive_ids']
+                pts = closest_points.cpu().numpy()
+        except Exception as e:
+            debug_info = self._create_debug_dump("compute_closest_points_failed")
+            raise RuntimeError(f"Failed to compute closest points: {e}")
+            
         # negative SDF gradient outside the object and positive SDF gradient inside the object
         gradient = pts - points_in_object_frame
 
@@ -137,9 +328,23 @@ class ObjectFactory(abc.ABC):
         # add noise to ray destination, this helps reduce artifacts in the sdf
         ray_destination = ray_destination + 1e-4 * np.random.randn(*points_in_object_frame.shape)
         ray_destination = ray_destination.astype(np.float32)
+        
+        # Validate ray destination
+        if np.any(~np.isfinite(ray_destination)):
+            raise ValueError("Ray destination contains invalid values")
+            
         # check if point is inside the object
         rays = np.concatenate([points_in_object_frame, ray_destination], axis=-1)
-        intersection_counts = self._raycasting_scene.count_intersections(rays).numpy()
+        
+        # Convert rays to Open3D tensor on the same device
+        o3d_rays = o3d.core.Tensor(rays, device=self._mesht.device)
+        
+        try:
+            with raycasting_operation_monitor(f"count_intersections_{rays.shape[0]}_rays"):
+                intersection_counts = self._raycasting_scene.count_intersections(o3d_rays).cpu().numpy()
+        except Exception as e:
+            debug_info = self._create_debug_dump("count_intersections_failed")
+            raise RuntimeError(f"Failed to count intersections: {e}")
         is_inside = intersection_counts % 2 == 1
         distance[is_inside] *= -1
         # fix gradient direction to point away from surface outside
@@ -149,7 +354,7 @@ class ObjectFactory(abc.ABC):
         # this is because the closest point on the surface may be noisy when close by
         # e.g. if you are actually on the surface, the closest surface point is itself so you get no gradient info
         on_surface = np.abs(distance) < 1e-3
-        surface_normals = self._face_normals[face_ids.numpy()[on_surface]]
+        surface_normals = self._face_normals[face_ids.cpu().numpy()[on_surface]]
         gradient[on_surface] = surface_normals
 
         pts, distance, gradient = tensor_utils.ensure_tensor(device, dtype, pts, distance, gradient)
@@ -175,7 +380,7 @@ class ObjectFactory(abc.ABC):
 
         normals = None
         if compute_normal:
-            normals = self._face_normals[face_ids.numpy()]
+            normals = self._face_normals[face_ids.cpu().numpy()]
             normals = torch.tensor(normals, device=device, dtype=dtype)
         return pts, distance, gradient, normals, hessian
 
@@ -201,7 +406,41 @@ class ObjectFactory(abc.ABC):
                                                              compute_hessian=compute_hessian))
 
     def get_mesh(self):
+        if not self._precomputed:
+            self.precompute_sdf()
         return self._mesh
+
+    def _create_debug_dump(self, operation="unknown"):
+        """Create debug information dump for troubleshooting segfaults."""
+        import traceback
+        import psutil
+        import gc
+        
+        debug_info = {
+            'operation': operation,
+            'mesh_file': getattr(self, 'name', 'unknown'),
+            'scale': getattr(self, 'scale', None),
+            'mesh_vertices': len(self._mesh.vertices) if self._mesh else 0,
+            'mesh_triangles': len(self._mesh.triangles) if self._mesh else 0,
+            'precomputed': self._precomputed,
+            'memory_usage': psutil.Process().memory_info().rss / 1024 / 1024,  # MB
+            'open_file_descriptors': len(psutil.Process().open_files()),
+            'thread_id': threading.current_thread().ident,
+            'stack_trace': traceback.format_stack(),
+            'gc_stats': gc.get_stats(),
+        }
+        
+        if self._mesh:
+            vertices = np.asarray(self._mesh.vertices)
+            debug_info.update({
+                'vertex_bounds_min': np.min(vertices, axis=0).tolist(),
+                'vertex_bounds_max': np.max(vertices, axis=0).tolist(),
+                'vertex_mean': np.mean(vertices, axis=0).tolist(),
+                'vertex_std': np.std(vertices, axis=0).tolist(),
+            })
+        
+        logger.info(f"Debug dump for {operation}: {debug_info}")
+        return debug_info
 
 
 class MeshObjectFactory(ObjectFactory):
@@ -231,11 +470,12 @@ class MeshObjectFactory(ObjectFactory):
 
 class ObjectFrameSDF(abc.ABC):
     @abc.abstractmethod
-    def __call__(self, points_in_object_frame, return_extra_info=False):
+    def __call__(self, points_in_object_frame, return_extra_info=False, compute_hessian=False):
         """
         Evaluate the signed distance function at given points in the object frame
         :param points_in_object_frame: B x N x d d-dimensional points (2 or 3) of B batches; located in object frame
         :param return_extra_info: bool: If true, returns a dictionary with return values and additional info
+        :param compute_hessian: bool: If true, returns the hessian of the SDF value at the closest point
         :return: If return_extra_info is False,
             tuple of B x N signed distance from closest object surface in m and B x N x d SDF gradient pointing
             towards higher SDF values (away from surface when outside the object and towards the surface when inside)
@@ -326,11 +566,11 @@ class MeshSDF(ObjectFrameSDF):
     def surface_bounding_box(self, padding=0.):
         return torch.tensor(self.obj_factory.bounding_box(padding))
 
-    def __call__(self, points_in_object_frame, return_extra_info=False):
+    def __call__(self, points_in_object_frame, return_extra_info=False, compute_hessian=False):
         N, d = points_in_object_frame.shape[-2:]
 
         # compute SDF value for new sampled points
-        res = self.obj_factory.object_frame_closest_point(points_in_object_frame, compute_hessian=return_extra_info)
+        res = self.obj_factory.object_frame_closest_point(points_in_object_frame, compute_hessian=compute_hessian)
 
         # points are transformed to link frame, thus it needs to compare against the object in link frame
         # objId is not in link frame and shouldn't be moved
@@ -347,7 +587,7 @@ class MeshSDF(ObjectFrameSDF):
             return {
                 'sdf_val': res.distance,
                 'sdf_grad': res.gradient,
-                'sdf_hess': res.hessian.reshape(*res.distance.shape, 3, 3),
+                'sdf_hess': res.hessian.reshape(*res.distance.shape, 3, 3) if res.hessian is not None else None,
             }
         return res.distance, res.gradient
 
@@ -372,7 +612,7 @@ class BoxSDF(ObjectFrameSDF):
         return torch.tensor([[-self.extents[0] - padding, -self.extents[1] - padding, -self.extents[2] - padding],
                              [self.extents[0] + padding, self.extents[1] + padding, self.extents[2] + padding]])
 
-    def __call__(self, points_in_object_frame, return_extra_info=False):
+    def __call__(self, points_in_object_frame, return_extra_info=False, compute_hessian=False):
         N, d = points_in_object_frame.shape[-2:]
 
         # first compute which octant we are in
@@ -399,7 +639,7 @@ class BoxSDF(ObjectFrameSDF):
 
         # Hessian for block is zero everywhere except for diagonals where it is undefined, so we set it to 0
         # TODO: Including radius of corners results in a non-zero hessian around corners, perhaps compute that?
-        sdf_hess = torch.zeros(*points_in_object_frame.shape[:-1], d, d, device=points_in_object_frame.device)
+        sdf_hess = torch.zeros(*points_in_object_frame.shape[:-1], d, d, device=points_in_object_frame.device) if (compute_hessian and return_extra_info) else None
 
         # points are transformed to link frame, thus it needs to compare against the object in link frame
         # objId is not in link frame and shouldn't be moved
@@ -575,18 +815,19 @@ class CylinderSDF(ObjectFrameSDF):
         # exit(0)
         return hess
 
-    def __call__(self, points_in_object_frame, return_extra_info=False):
+    def __call__(self, points_in_object_frame, return_extra_info=False, compute_hessian=False):
         N, d = points_in_object_frame.shape[-2:]
 
         # sdf_value = self._get_sdf(points_in_object_frame)
         # sdf_grad = self._get_sdf_grad(points_in_object_frame)
         sdf_value, sdf_grad = self._project_to_cylinder(points_in_object_frame)
 
-        sdf_hess = self._get_sdf_hess(points_in_object_frame)
+        sdf_hess = self._get_sdf_hess(points_in_object_frame) if (compute_hessian and return_extra_info) else None
         # TODO: Including radius of corners results in a non-zero hessian around corners, perhaps compute that?
         sdf_value = sdf_value.reshape(*points_in_object_frame.shape[:-1])
         sdf_grad = sdf_grad.reshape(*points_in_object_frame.shape[:-1], d)
-        sdf_hess = sdf_hess.reshape(*points_in_object_frame.shape[:-1], d, d)
+        if sdf_hess is not None:
+            sdf_hess = sdf_hess.reshape(*points_in_object_frame.shape[:-1], d, d)
 
         # points are transformed to link frame, thus it needs to compare against the object in link frame
         # objId is not in link frame and shouldn't be moved
@@ -724,16 +965,17 @@ class SphereSDF(ObjectFrameSDF):
                              [-self.radius - padding, self.radius + padding],
                              [-self.radius - padding, self.radius + padding]])
 
-    def __call__(self, points_in_object_frame: torch.Tensor, return_extra_info=False):
+    def __call__(self, points_in_object_frame: torch.Tensor, return_extra_info=False, compute_hessian=False):
         norm = torch.linalg.norm(points_in_object_frame, dim=-1, keepdim=True)
         sdf_val = norm.squeeze(-1) - self.radius
         sdf_grad = points_in_object_frame / norm
 
         N, d = points_in_object_frame.shape[-2:]
-        eye = torch.eye(d, device=points_in_object_frame.device).expand(*points_in_object_frame.shape[:-1], d, d)
-
-        outer = points_in_object_frame.unsqueeze(-1) @ points_in_object_frame.unsqueeze(-2)
-        sdf_hess = (eye * norm.unsqueeze(-1) ** 2 - outer) / norm.unsqueeze(-1) ** 3
+        sdf_hess = None
+        if compute_hessian and return_extra_info:
+            eye = torch.eye(d, device=points_in_object_frame.device).expand(*points_in_object_frame.shape[:-1], d, d)
+            outer = points_in_object_frame.unsqueeze(-1) @ points_in_object_frame.unsqueeze(-2)
+            sdf_hess = (eye * norm.unsqueeze(-1) ** 2 - outer) / norm.unsqueeze(-1) ** 3
 
         if return_extra_info:
             return {
@@ -795,7 +1037,7 @@ class DeepSDF(ObjectFrameSDF):
     def surface_bounding_box(self, padding=0.):
         raise NotImplementedError
 
-    def __call__(self, points_in_object_frame: torch.Tensor, return_extra_info=False):
+    def __call__(self, points_in_object_frame: torch.Tensor, return_extra_info=False, compute_hessian=False):
         p = points_in_object_frame.reshape(-1, 3)
         points_shape = points_in_object_frame.shape
         points_in_object_frame = points_in_object_frame.detach()
@@ -805,9 +1047,9 @@ class DeepSDF(ObjectFrameSDF):
         points_in_object_frame = points_in_object_frame.detach()
         points_in_object_frame.requires_grad = False
         sdf_val = sdf_val.reshape(points_shape[:-1])
-        sdf_hess = torch.zeros(points_shape[:-1] + (3, 3), device=points_in_object_frame.device)
+        sdf_hess = torch.zeros(points_shape[:-1] + (3, 3), device=points_in_object_frame.device) if (compute_hessian and return_extra_info) else None
 
-        if return_extra_info:
+        if compute_hessian and return_extra_info:
             return {
                 'sdf_val': sdf_val,
                 'sdf_grad': sdf_grad,
@@ -885,7 +1127,7 @@ class ComposedSDF(ObjectFrameSDF):
             total_to_slice = math.prod(list(self.tsf_batch))
             return slice(i * total_to_slice, (i + 1) * total_to_slice)
 
-    def __call__(self, points_in_object_frame, return_extra_info=False):
+    def __call__(self, points_in_object_frame, return_extra_info=False, compute_hessian=False):
         pts_shape = points_in_object_frame.shape
         S = len(self.sdfs)
         # S x B x N x 3
@@ -907,15 +1149,16 @@ class ComposedSDF(ObjectFrameSDF):
         sdfh = []
         for i, sdf in enumerate(self.sdfs):
             # B x N for v and B x N x 3 for g
-            sdf_result = sdf(pts[i], return_extra_info=True)
+            sdf_result = sdf(pts[i], return_extra_info=True, compute_hessian=compute_hessian)
             v = sdf_result['sdf_val']
             g = sdf_result['sdf_grad']
-            h = sdf_result['sdf_hess']
+            h = sdf_result['sdf_hess'] if (compute_hessian and return_extra_info) else None
             # need to transform the gradient back to the object frame
             g = self.link_frame_to_obj_frame[i].transform_normals(g)
 
             # transform the hessian also
-            h = self.link_frame_to_obj_frame[i].transform_shape_operator(h)
+            if h is not None:
+                h = self.link_frame_to_obj_frame[i].transform_shape_operator(h)
             sdfv.append(v)
             sdfg.append(g)
             sdfh.append(h)
@@ -923,12 +1166,12 @@ class ComposedSDF(ObjectFrameSDF):
         # attempt at doing things in higher dimensions
         sdfv = torch.cat(sdfv)
         sdfg = torch.cat(sdfg)
-        sdfh = torch.cat(sdfh)
+        sdfh = torch.cat(sdfh) if (compute_hessian and return_extra_info) else None
 
         # easier solution for flattening
         v = sdfv.reshape(S, -1)
         g = sdfg.reshape(S, -1, 3)
-        h = sdfh.reshape(S, -1, 3, 3)
+        h = sdfh.reshape(S, -1, 3, 3) if (compute_hessian and return_extra_info) else None
         # ensure S is the first dimension and take min across S (the different links)
         closest = torch.argmin(v, 0)
 
@@ -936,11 +1179,11 @@ class ComposedSDF(ObjectFrameSDF):
         # B*N for vv and B*N x 3 for gg and B*N x 3 x 3 for hh
         vv = v[closest, all]
         gg = g[closest, all]
-        hh = h[closest, all]
+        hh = h[closest, all] if (compute_hessian and return_extra_info) else None
         if self.tsf_batch is not None:
             vv = vv.reshape(*pts_shape[:-1])
             gg = gg.reshape(*pts_shape[:-1], 3)
-            hh = hh.reshape(*pts_shape[:-1], 3, 3)
+            hh = hh.reshape(*pts_shape[:-1], 3, 3) if (compute_hessian and return_extra_info) else None
             closest = closest.reshape(*pts_shape[:-1])
         if not return_extra_info:
             return vv, gg
@@ -1110,7 +1353,7 @@ class CachedSDF(ObjectFrameSDF):
         sdf_val = sdf_val.to(device=self.device)
         return sdf_val
 
-    def __call__(self, points_in_object_frame, return_extra_info=False):
+    def __call__(self, points_in_object_frame, return_extra_info=False, compute_hessian=False):
         # check when points are out of cached range and use ground truth sdf for both value and grad
         keys = self.voxels.ensure_index_key(points_in_object_frame)
         keys_ravelled = self.voxels.ravel_multi_index(keys, self.voxels.shape)
@@ -1121,7 +1364,7 @@ class CachedSDF(ObjectFrameSDF):
         dtype = points_in_object_frame.dtype
         val = torch.zeros(keys_ravelled.shape, device=self.device, dtype=dtype)
         grad = torch.zeros(keys.shape, device=self.device, dtype=dtype)
-        hess = torch.zeros(keys.shape + (3,), device=self.device, dtype=dtype)
+        hess = torch.zeros(keys.shape + (3,), device=self.device, dtype=dtype) if (compute_hessian and return_extra_info) else None
 
         val[inbound_keys] = self.voxels.raw_data[keys_ravelled[inbound_keys]]
         grad[inbound_keys] = self.voxels_grad[keys_ravelled[inbound_keys]]
@@ -1133,16 +1376,15 @@ class CachedSDF(ObjectFrameSDF):
         # 
         # print(torch.sum(inbound_keys))
         # print(torch.sum(out_of_bound_keys))
-        if self.voxels_hessian is not None:
+        if self.voxels_hessian is not None and compute_hessian and return_extra_info:
             hess[inbound_keys] = self.voxels_hessian[keys_ravelled[inbound_keys]]
             gt_result = self.gt_sdf(points_in_object_frame[out_of_bound_keys], return_extra_info=True)
             val[out_of_bound_keys] = gt_result['sdf_val']
             grad[out_of_bound_keys] = gt_result['sdf_grad']
-            hess[out_of_bound_keys] = gt_result['sdf_hess']
+            hess[out_of_bound_keys] = gt_result['sdf_hess'] if (compute_hessian and return_extra_info) else None
         else:
             gt_result = self.gt_sdf(points_in_object_frame[out_of_bound_keys], return_extra_info=False)
             val[out_of_bound_keys], grad[out_of_bound_keys] = gt_result
-            hess = None
 
         if self.debug_check_sdf:
             val_gt = self._fallback_sdf_value_func(points_in_object_frame)
@@ -1194,7 +1436,7 @@ class URDFSDF(ObjectFrameSDF):
 
     def __init__(self, chain: pk.Chain, path_prefix='',
                  link_sdf_cls: typing.Callable[[ObjectFactory], ObjectFrameSDF] = MeshSDF,
-                 use_collision_geometry=False, **kwargs):
+                 use_collision_geometry=False):
         """
 
         :param chain: Robot description; each link should be a mesh type - non-mesh geometries are ignored
@@ -1203,8 +1445,6 @@ class URDFSDF(ObjectFrameSDF):
         relative paths. This given path is prefixed onto those relative paths in order to find the meshes.
         :param link_sdf_cls: Factory of each link's SDFs; **kwargs are forwarded to this factory
         :param use_collision_geometry: If True, use the collision geometry instead of the visual geometry
-        :param kwargs: Keyword arguments fed to link_sdf_cls
-
         """
         self.chain = chain
         self.dtype = self.chain.dtype
@@ -1289,7 +1529,7 @@ class URDFSDF(ObjectFrameSDF):
         """
         return self.sdf.sdfs[self.sdf_to_link_name.index(link_name)]
 
-    def __call__(self, points_in_object_frame, return_extra_info=False):
+    def __call__(self, points_in_object_frame, return_extra_info=False, compute_hessian=False):
         """
         Query for SDF value and SDF gradients for points in the robot's frame
         :param points_in_object_frame: [B x] N x 3 optionally arbitrarily batched points in the robot frame; B can be
@@ -1297,7 +1537,7 @@ class URDFSDF(ObjectFrameSDF):
         :return: [A x] [B x] N SDF value, and [A x] [B x] N x 3 SDF gradient. A are the configurations' arbitrary
         number of batch dimensions.
         """
-        return self.sdf(points_in_object_frame, return_extra_info)
+        return self.sdf(points_in_object_frame, return_extra_info, compute_hessian)
 
     def precompute_sdf(self):
         self.sdf.precompute_sdf()
@@ -1307,7 +1547,6 @@ class URDFSDF(ObjectFrameSDF):
 
     def get_mesh_list(self):
         return self.sdf.get_mesh_list()
-
 
 
 def sample_mesh_points(obj_factory: ObjectFactory = None, num_points=100, seed=0, name="",
@@ -1380,3 +1619,127 @@ def get_composed_meshes(composed_sdf: ComposedSDF, obj_to_world_tsf=None):
         mesh = mesh.transform(tsfs[i].cpu().numpy())
         meshes.append(mesh)
     return meshes
+
+def setup_crash_handler():
+    """Setup signal handlers to catch segfaults and provide debugging info."""
+    def segfault_handler(signum, frame):
+        import traceback
+        import sys
+        
+        logger.critical("SEGMENTATION FAULT DETECTED!")
+        logger.critical(f"Signal: {signum}")
+        logger.critical(f"Frame: {frame}")
+        logger.critical("Stack trace:")
+        traceback.print_stack(frame)
+        
+        # Try to get some system info before crashing
+        try:
+            import psutil
+            process = psutil.Process()
+            logger.critical(f"Memory usage: {process.memory_info().rss / 1024 / 1024:.2f} MB")
+            logger.critical(f"CPU usage: {process.cpu_percent()}%")
+            logger.critical(f"Open files: {len(process.open_files())}")
+            logger.critical(f"Threads: {process.num_threads()}")
+        except:
+            pass
+        
+        # Force flush logs
+        for handler in logger.handlers:
+            handler.flush()
+        
+        # Re-raise the signal to get the default behavior (core dump, etc.)
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+    
+    # Only set up on Unix-like systems
+    if hasattr(signal, 'SIGSEGV'):
+        signal.signal(signal.SIGSEGV, segfault_handler)
+    if hasattr(signal, 'SIGBUS'):
+        signal.signal(signal.SIGBUS, segfault_handler)
+
+# Set up crash handler when module is imported
+setup_crash_handler()
+
+@contextmanager
+def raycasting_operation_monitor(operation_name, timeout_seconds=30):
+    """Context manager to monitor raycasting operations with timeout."""
+    start_time = time.time()
+    logger.debug(f"Starting {operation_name}")
+    
+    try:
+        yield
+        elapsed = time.time() - start_time
+        logger.debug(f"Completed {operation_name} in {elapsed:.3f}s")
+        
+    except Exception as e:
+        elapsed = time.time() - start_time
+        logger.error(f"Failed {operation_name} after {elapsed:.3f}s: {e}")
+        raise
+        
+    finally:
+        elapsed = time.time() - start_time
+        if elapsed > timeout_seconds:
+            logger.warning(f"{operation_name} took {elapsed:.3f}s (longer than {timeout_seconds}s timeout)")
+
+def check_open3d_cuda_support():
+    """
+    Check if Open3D has CUDA support and provide setup information.
+    
+    Returns:
+        dict: Information about CUDA support status
+    """
+    info = {
+        'has_cuda_module': hasattr(o3d.core, 'cuda'),
+        'cuda_device_count': 0,
+        'can_create_cuda_device': False,
+        'recommendations': []
+    }
+    
+    if info['has_cuda_module']:
+        try:
+            info['cuda_device_count'] = o3d.core.cuda.device_count()
+            if info['cuda_device_count'] > 0:
+                try:
+                    test_device = o3d.core.Device("CUDA:0")
+                    info['can_create_cuda_device'] = True
+                    logger.info(f"Open3D CUDA support detected: {info['cuda_device_count']} device(s)")
+                except Exception as e:
+                    info['recommendations'].append(f"CUDA devices detected but failed to create device: {e}")
+            else:
+                info['recommendations'].append("No CUDA devices detected")
+        except Exception as e:
+            info['recommendations'].append(f"Error checking CUDA devices: {e}")
+    else:
+        info['recommendations'].extend([
+            "Open3D was not compiled with CUDA support",
+            "Install CUDA-enabled Open3D: pip install open3d[cuda] (if available)",
+            "Or build Open3D from source with CUDA enabled"
+        ])
+    
+    return info
+
+
+def configure_sdf_cuda(enable=True):
+    """
+    Configure CUDA usage for SDF operations.
+    
+    Args:
+        enable (bool): Whether to enable CUDA acceleration
+    """
+    os.environ['O3D_PREFER_CUDA'] = str(enable).lower()
+    os.environ['O3D_CPU_ONLY'] = str(not enable).lower()
+    
+    # Update current platform settings
+    CURRENT_PLATFORM['prefer_cuda'] = enable
+    CURRENT_PLATFORM['use_cpu_only'] = not enable
+    
+    if enable:
+        cuda_info = check_open3d_cuda_support()
+        if not cuda_info['can_create_cuda_device']:
+            logger.warning("CUDA requested but not available. Recommendations:")
+            for rec in cuda_info['recommendations']:
+                logger.warning(f"  - {rec}")
+        else:
+            logger.info("CUDA acceleration enabled for SDF operations")
+    else:
+        logger.info("CPU-only mode enabled for SDF operations")

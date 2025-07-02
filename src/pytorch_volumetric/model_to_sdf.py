@@ -147,7 +147,7 @@ class RobotSDF(sdf.ObjectFrameSDF):
         """
         return self.sdf.sdfs[self.sdf_to_link_name.index(link_name)]
 
-    def __call__(self, points_in_object_frame, return_extra_info=False):
+    def __call__(self, points_in_object_frame, return_extra_info=False, compute_hessian=False):
         """
         Query for SDF value and SDF gradients for points in the robot's frame
         :param points_in_object_frame: [B x] N x 3 optionally arbitrarily batched points in the robot frame; B can be
@@ -155,7 +155,7 @@ class RobotSDF(sdf.ObjectFrameSDF):
         :return: [A x] [B x] N SDF value, and [A x] [B x] N x 3 SDF gradient. A are the configurations' arbitrary
         number of batch dimensions.
         """
-        return self.sdf(points_in_object_frame, return_extra_info)
+        return self.sdf(points_in_object_frame, return_extra_info, compute_hessian)
 
     def precompute_sdf(self):
         self.sdf.precompute_sdf()
