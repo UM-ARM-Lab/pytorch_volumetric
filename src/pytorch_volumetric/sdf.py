@@ -2,6 +2,7 @@ import abc
 import enum
 import math
 import os
+import pickle
 import typing
 from typing import NamedTuple, Union
 
@@ -485,7 +486,9 @@ class CachedSDF(ObjectFrameSDF):
         self.debug_check_sdf = debug_check_sdf
 
         if os.path.exists(cache_path):
-            data = torch.load(cache_path) or {}
+            # data = torch.load(cache_path) or {}
+            with open(cache_path, "rb") as f:
+                data = pickle.load(f)
             try:
                 cached_underlying_sdf, cached_underlying_sdf_grad = data[self.name]
                 logger.info("cached sdf for %s loaded from %s", self.name, cache_path)
@@ -513,7 +516,9 @@ class CachedSDF(ObjectFrameSDF):
 
             data[self.name] = cached_underlying_sdf, cached_underlying_sdf_grad
 
-            torch.save(data, cache_path)
+            # torch.save(data, cache_path)
+            with open(cache_path, "wb") as f:
+                pickle.dump(data, f)
             logger.info("caching sdf for %s to %s", self.name, cache_path)
 
         cached_underlying_sdf = cached_underlying_sdf.to(device=device)
