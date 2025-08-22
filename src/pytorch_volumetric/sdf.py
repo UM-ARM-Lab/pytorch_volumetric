@@ -16,7 +16,7 @@ from typing import NamedTuple, Union
 
 import numpy as np
 import open3d as o3d
-o3d.utility.set_verbosity_level(o3d.utility.VerbosityLevel.Debug)
+# o3d.utility.set_verbosity_level(o3d.utility.VerbosityLevel.Debug)
 
 import torch
 from arm_pytorch_utilities import tensor_utils, rand
@@ -1743,3 +1743,9 @@ def configure_sdf_cuda(enable=True):
             logger.info("CUDA acceleration enabled for SDF operations")
     else:
         logger.info("CPU-only mode enabled for SDF operations")
+
+
+if __name__ == "__main__":
+    sdf = SphereSDF(1.0)
+    points = torch.randn(100, 3)
+    print(sdf(points))
