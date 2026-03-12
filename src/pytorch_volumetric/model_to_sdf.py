@@ -114,15 +114,17 @@ class RobotSDF(sdf.ObjectFrameSDF):
         if self.sdf is not None:
             self.sdf.set_transforms(self.object_to_link_frames, batch_dim=self.configuration_batch)
 
-    def __call__(self, points_in_object_frame):
+    def __call__(self, points_in_object_frame, compute_grad=True):
         """
         Query for SDF value and SDF gradients for points in the robot's frame
         :param points_in_object_frame: [B x] N x 3 optionally arbitrarily batched points in the robot frame; B can be
         any number of batch dimensions.
-        :return: [A x] [B x] N SDF value, and [A x] [B x] N x 3 SDF gradient. A are the configurations' arbitrary
-        number of batch dimensions.
+        :param compute_grad: whether to compute and return the SDF gradient. When False, the gradient return value
+            is None. Set to False for better performance when only SDF values are needed.
+        :return: [A x] [B x] N SDF value, and [A x] [B x] N x 3 SDF gradient (or None if compute_grad is False).
+        A are the configurations' arbitrary number of batch dimensions.
         """
-        return self.sdf(points_in_object_frame)
+        return self.sdf(points_in_object_frame, compute_grad=compute_grad)
 
 
 def cache_link_sdf_factory(resolution=0.01, padding=0.1, **kwargs):

@@ -218,12 +218,15 @@ class MeshObjectFactory(ObjectFactory):
 class ObjectFrameSDF(Function):
 
     @abc.abstractmethod
-    def __call__(self, points_in_object_frame):
+    def __call__(self, points_in_object_frame, compute_grad=True):
         """
         Evaluate the signed distance function at given points in the object frame
         :param points_in_object_frame: B x N x d d-dimensional points (2 or 3) of B batches; located in object frame
+        :param compute_grad: whether to compute and return the SDF gradient. When False, the gradient return value
+            is None and autograd is not supported. Set to False for better performance when only SDF values are needed.
         :return: tuple of B x N signed distance from closest object surface in m and B x N x d SDF gradient pointing
-            towards higher SDF values (away from surface when outside the object and towards the surface when inside)
+            towards higher SDF values (away from surface when outside the object and towards the surface when inside),
+            or None if compute_grad is False
         """
 
     @staticmethod
@@ -252,7 +255,7 @@ class ObjectFrameSDF(Function):
         :param surface_level: The level set value for separating points
         :return: B x N bool
         """
-        sdf_values, _ = self.__call__(points_in_object_frame)
+        sdf_values, _ = self.__call__(points_in_object_frame, compute_grad=False)
         outside = sdf_values > surface_level
         return outside
 
@@ -299,8 +302,11 @@ class SphereSDF(ObjectFrameSDF):
     def __init__(self, radius):
         self.radius = radius
 
-    def __call__(self, points_in_object_frame):
-        return self.apply(points_in_object_frame, self.radius)
+    def __call__(self, points_in_object_frame, compute_grad=True):
+        if compute_grad:
+            return self.apply(points_in_object_frame, self.radius)
+        dist_to_origin = torch.linalg.norm(points_in_object_frame, dim=-1)
+        return dist_to_origin - self.radius, None
 
     @staticmethod
     def forward(ctx, points_in_object_frame, radius):
@@ -327,8 +333,11 @@ class MeshSDF(ObjectFrameSDF):
     def surface_bounding_box(self, **kwargs):
         return torch.tensor(self.obj_factory.bounding_box(**kwargs))
 
-    def __call__(self, points_in_object_frame):
-        return self.apply(points_in_object_frame, self.obj_factory, self.vis)
+    def __call__(self, points_in_object_frame, compute_grad=True):
+        if compute_grad:
+            return self.apply(points_in_object_frame, self.obj_factory, self.vis)
+        res = self.obj_factory.object_frame_closest_point(points_in_object_frame)
+        return res.distance, None
 
     @staticmethod
     def forward(ctx, points_in_object_frame, obj_factory, vis=None):
@@ -413,9 +422,30 @@ class ComposedSDF(ObjectFrameSDF):
             total_to_slice = math.prod(list(self.tsf_batch))
             return slice(i * total_to_slice, (i + 1) * total_to_slice)
 
-    def __call__(self, points_in_object_frame):
-        return self.apply(points_in_object_frame, self.sdfs, self.obj_frame_to_link_frame, self.tsf_batch,
-                          self.link_frame_to_obj_frame)
+    def __call__(self, points_in_object_frame, compute_grad=True):
+        if compute_grad:
+            return self.apply(points_in_object_frame, self.sdfs, self.obj_frame_to_link_frame, self.tsf_batch,
+                              self.link_frame_to_obj_frame)
+        return self._forward_no_grad(points_in_object_frame)
+
+    def _forward_no_grad(self, points_in_object_frame):
+        pts_shape = points_in_object_frame.shape
+        points_in_object_frame = points_in_object_frame.view(-1, 3)
+        flat_shape = points_in_object_frame.shape
+        S = len(self.sdfs)
+        pts = self.obj_frame_to_link_frame.transform_points(points_in_object_frame)
+        if self.tsf_batch is not None:
+            pts = pts.reshape(S, *self.tsf_batch, *flat_shape)
+        sdfv = []
+        for i, sdf in enumerate(self.sdfs):
+            v, _ = sdf(pts[i], compute_grad=False)
+            sdfv.append(v)
+        sdfv = torch.cat(sdfv)
+        v = sdfv.reshape(S, -1)
+        vv = v.min(dim=0).values
+        if self.tsf_batch is not None:
+            vv = vv.reshape(*self.tsf_batch, *pts_shape[:-1])
+        return vv, None
 
     @staticmethod
     def forward(ctx, points_in_object_frame, sdfs, obj_frame_to_link_frame, tsf_batch, link_frame_to_obj_frame):
@@ -563,9 +593,37 @@ class CachedSDF(ObjectFrameSDF):
         sdf_val = sdf_val.to(device=self.device)
         return sdf_val
 
-    def __call__(self, points_in_object_frame):
-        return self.apply(points_in_object_frame, self.voxels, self.voxels_grad, self.bb, self.out_of_bounds_strategy,
-                          self.device, self.gt_sdf)
+    def __call__(self, points_in_object_frame, compute_grad=True):
+        if compute_grad:
+            return self.apply(points_in_object_frame, self.voxels, self.voxels_grad, self.bb,
+                              self.out_of_bounds_strategy, self.device, self.gt_sdf)
+        return self._forward_no_grad(points_in_object_frame)
+
+    def _forward_no_grad(self, points_in_object_frame):
+        keys = self.voxels.ensure_index_key(points_in_object_frame)
+        keys_ravelled = self.voxels.ravel_multi_index(keys, self.voxels.shape)
+
+        inbound_keys = self.voxels.get_valid_values(points_in_object_frame)
+        out_of_bound_keys = ~inbound_keys
+
+        dtype = points_in_object_frame.dtype
+        val = torch.zeros(keys_ravelled.shape, device=self.device, dtype=dtype)
+        val[inbound_keys] = self.voxels.raw_data[keys_ravelled[inbound_keys]]
+
+        points_oob = points_in_object_frame[out_of_bound_keys]
+        if self.out_of_bounds_strategy == OutOfBoundsStrategy.LOOKUP_GT_SDF:
+            val[out_of_bound_keys], _ = self.gt_sdf(points_oob, compute_grad=False)
+        elif self.out_of_bounds_strategy == OutOfBoundsStrategy.BOUNDING_BOX:
+            bb = self.bb
+            if bb.dtype != dtype:
+                bb = bb.to(dtype=dtype)
+            dmin = bb[:, 0] - points_oob
+            dmin[dmin < 0] = 0
+            dmax = points_oob - bb[:, 1]
+            dmax[dmax < 0] = 0
+            val[out_of_bound_keys] = (dmin + dmax).norm(dim=-1)
+
+        return val, None
 
     @staticmethod
     def forward(ctx, points_in_object_frame, voxels, voxels_grad, bb, out_of_bounds_strategy, device, gt_sdf):
