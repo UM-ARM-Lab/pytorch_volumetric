@@ -128,7 +128,7 @@ def test_bench_step_per_link_sdf(benchmark, composed_internals, device):
 
 
 def test_bench_step_transform_grads(benchmark, composed_internals, device):
-    """Benchmark: transform gradients back to object frame for all links."""
+    """Benchmark: transform gradients back to object frame for all links (precomputed rotation)."""
     composed, pts = composed_internals
     N = pts.shape[0]
     S = len(composed.sdfs)
@@ -136,7 +136,7 @@ def test_bench_step_transform_grads(benchmark, composed_internals, device):
 
     def do_grad_transform():
         for i in range(S):
-            composed.link_frame_to_obj_frame[i].transform_normals(dummy_grads[i])
+            torch.mm(dummy_grads[i], composed._grad_rotation_mats[i].squeeze(0))
         if device == "cuda":
             torch.cuda.synchronize()
 

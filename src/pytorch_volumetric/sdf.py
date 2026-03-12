@@ -404,6 +404,11 @@ class ComposedSDF(ObjectFrameSDF):
         self.obj_frame_to_link_frame = tsf
         self.link_frame_to_obj_frame = []
         self.tsf_batch = batch_dim
+        # precomputed rotation matrices for transforming gradients back to object frame
+        # link_frame_to_obj_frame[i].transform_normals(g) computes inverse().get_matrix()[:,:3,:3] @ g
+        # which is the rotation part of obj_frame_to_link_frame (since link_frame_to_obj_frame is already inverted)
+        # we precompute these to avoid recomputing the inverse 8 times per query
+        self._grad_rotation_mats = []
         # assume a single batch dimension when not given B x N x 4 x 4
         if tsf is not None:
             S = len(self.sdfs)
@@ -412,8 +417,14 @@ class ComposedSDF(ObjectFrameSDF):
                 self.tsf_batch = (S_tsf / S,)
             m = tsf.get_matrix().inverse()
             for i in range(S):
-                self.link_frame_to_obj_frame.append(
-                    pk.Transform3d(matrix=m[self.ith_transform_slice(i)]))
+                mi = m[self.ith_transform_slice(i)]
+                self.link_frame_to_obj_frame.append(pk.Transform3d(matrix=mi))
+                # rotation part of link_frame_to_obj_frame: mi[:, :3, :3]
+                # transform_normals computes inverse of that = transpose for rotation matrices
+                # but the inverse of link_frame_to_obj_frame is obj_frame_to_link_frame
+                # so the rotation is tsf.get_matrix()[slice][:, :3, :3]
+                self._grad_rotation_mats.append(
+                    tsf.get_matrix()[self.ith_transform_slice(i)][:, :3, :3])
 
     def ith_transform_slice(self, i):
         if self.tsf_batch is None:
@@ -425,7 +436,7 @@ class ComposedSDF(ObjectFrameSDF):
     def __call__(self, points_in_object_frame, compute_grad=True):
         if compute_grad:
             return self.apply(points_in_object_frame, self.sdfs, self.obj_frame_to_link_frame, self.tsf_batch,
-                              self.link_frame_to_obj_frame)
+                              self._grad_rotation_mats)
         return self._forward_no_grad(points_in_object_frame)
 
     def _forward_no_grad(self, points_in_object_frame):
@@ -448,7 +459,7 @@ class ComposedSDF(ObjectFrameSDF):
         return vv, None
 
     @staticmethod
-    def forward(ctx, points_in_object_frame, sdfs, obj_frame_to_link_frame, tsf_batch, link_frame_to_obj_frame):
+    def forward(ctx, points_in_object_frame, sdfs, obj_frame_to_link_frame, tsf_batch, grad_rotation_mats):
         pts_shape = points_in_object_frame.shape
         # flatten it for the transform
         points_in_object_frame = points_in_object_frame.view(-1, 3)
@@ -464,8 +475,20 @@ class ComposedSDF(ObjectFrameSDF):
         for i, sdf in enumerate(sdfs):
             # B x N for v and B x N x 3 for g
             v, g = sdf(pts[i])
-            # need to transform the gradient back to the object frame
-            g = link_frame_to_obj_frame[i].transform_normals(g)
+            # transform the gradient back to the object frame using precomputed rotation matrices
+            # this replaces link_frame_to_obj_frame[i].transform_normals(g) which recomputes
+            # the inverse every call; grad_rotation_mats[i] is the rotation part of
+            # obj_frame_to_link_frame (= inverse of link_frame_to_obj_frame)
+            rot = grad_rotation_mats[i]
+            if g.dim() == 2:
+                g = torch.mm(g, rot.squeeze(0))
+            else:
+                if len(g) != len(rot):
+                    if len(rot) == 1:
+                        rot = rot.expand(len(g), -1, -1)
+                    elif len(g) == 1:
+                        g = g.expand(len(rot), -1, -1)
+                g = g.bmm(rot)
             sdfv.append(v)
             sdfg.append(g)
 
