@@ -424,8 +424,8 @@ class ComposedSDF(ObjectFrameSDF):
             self._precompute_batch_lookup()
 
     def _precompute_batch_lookup(self):
-        """Set up BatchedViewLookup if all SDFs are CachedSDF."""
-        if not all(isinstance(s, CachedSDF) for s in self.sdfs):
+        """Set up BatchedViewLookup if all SDFs are CachedSDF with nearest-neighbor interpolation."""
+        if not all(isinstance(s, CachedSDF) and s.method == 'nearest' for s in self.sdfs):
             self._batched_view = None
             return
         self._batched_view = BatchedViewLookup([s.voxels for s in self.sdfs])
@@ -563,7 +563,8 @@ class CachedSDF(ObjectFrameSDF):
     def __init__(self, object_name, resolution, range_per_dim, gt_sdf: ObjectFrameSDF,
                  out_of_bounds_strategy=OutOfBoundsStrategy.BOUNDING_BOX,
                  device="cpu", clean_cache=False,
-                 debug_check_sdf=False, cache_path="sdf_cache.pkl"):
+                 debug_check_sdf=False, cache_path="sdf_cache.pkl",
+                 method='nearest'):
         """
 
         :param object_name: str readable name of the object; combined with the resolution and range for cache
@@ -577,7 +578,10 @@ class CachedSDF(ObjectFrameSDF):
         :param clean_cache: whether to ignore the existing cache and force recomputation
         :param debug_check_sdf: check that the generated SDF matches the ground truth SDF
         :param cache_path: path where to store the SDF cache for efficient loading
+        :param method: interpolation method for voxel lookups, 'nearest' or 'linear'.
+        'linear' gives higher accuracy at a small performance cost.
         """
+        self.method = method
         self.device = device
         # cache for signed distance field to object
         self.voxels = None
@@ -638,7 +642,8 @@ class CachedSDF(ObjectFrameSDF):
         cached_underlying_sdf = cached_underlying_sdf.to(device=device)
         cached_underlying_sdf_grad = cached_underlying_sdf_grad.to(device=device)
         self.voxels = torch_view.TorchMultidimView(cached_underlying_sdf, range_per_dim,
-                                                   invalid_value=self._fallback_sdf_value_func)
+                                                   invalid_value=self._fallback_sdf_value_func,
+                                                   method=self.method)
         self.voxels_grad = cached_underlying_sdf_grad.squeeze()
 
         self.bb = self.surface_bounding_box().to(device=device)
@@ -654,10 +659,17 @@ class CachedSDF(ObjectFrameSDF):
     def __call__(self, points_in_object_frame, compute_grad=True):
         if compute_grad:
             return self.apply(points_in_object_frame, self.voxels, self.voxels_grad, self.bb,
-                              self.out_of_bounds_strategy, self.device, self.gt_sdf)
+                              self.out_of_bounds_strategy, self.device, self.gt_sdf, self.method)
         return self._forward_no_grad(points_in_object_frame)
 
     def _forward_no_grad(self, points_in_object_frame):
+        if self.method == 'linear':
+            # use TorchMultidimView.__getitem__ which handles trilinear interpolation
+            # the view's invalid_value callback handles OOB points
+            val = self.voxels[points_in_object_frame]
+            return val, None
+
+        # nearest-neighbor fast path: manual index computation
         keys = self.voxels.ensure_index_key(points_in_object_frame)
         keys_ravelled = self.voxels.ravel_multi_index(keys, self.voxels.shape)
 
@@ -684,22 +696,30 @@ class CachedSDF(ObjectFrameSDF):
         return val, None
 
     @staticmethod
-    def forward(ctx, points_in_object_frame, voxels, voxels_grad, bb, out_of_bounds_strategy, device, gt_sdf):
-        # check when points are out of cached range and use ground truth sdf for both value and grad
-        keys = voxels.ensure_index_key(points_in_object_frame)
-        keys_ravelled = voxels.ravel_multi_index(keys, voxels.shape)
-
-        inbound_keys = voxels.get_valid_values(points_in_object_frame)
-        out_of_bound_keys = ~inbound_keys
-
-        # logger.info(f"out of bound keys: {out_of_bound_keys.sum()}/{out_of_bound_keys.numel()}")
-
-        dtype = points_in_object_frame.dtype
-        val = torch.zeros(keys_ravelled.shape, device=device, dtype=dtype)
-        grad = torch.zeros(keys.shape, device=device, dtype=dtype)
-
-        val[inbound_keys] = voxels.raw_data[keys_ravelled[inbound_keys]]
-        grad[inbound_keys] = voxels_grad[keys_ravelled[inbound_keys]]
+    def forward(ctx, points_in_object_frame, voxels, voxels_grad, bb, out_of_bounds_strategy, device, gt_sdf,
+                method='nearest'):
+        if method == 'linear':
+            # use TorchMultidimView.__getitem__ for trilinear interpolation of values
+            val = voxels[points_in_object_frame]
+            # for gradients, use nearest-neighbor (gradient is piecewise constant per voxel)
+            keys = voxels.ensure_index_key(points_in_object_frame)
+            keys_ravelled = voxels.ravel_multi_index(keys, voxels.shape)
+            inbound_keys = voxels.get_valid_values(points_in_object_frame)
+            out_of_bound_keys = ~inbound_keys
+            dtype = points_in_object_frame.dtype
+            grad = torch.zeros(keys.shape, device=device, dtype=dtype)
+            grad[inbound_keys] = voxels_grad[keys_ravelled[inbound_keys]]
+        else:
+            # nearest-neighbor fast path
+            keys = voxels.ensure_index_key(points_in_object_frame)
+            keys_ravelled = voxels.ravel_multi_index(keys, voxels.shape)
+            inbound_keys = voxels.get_valid_values(points_in_object_frame)
+            out_of_bound_keys = ~inbound_keys
+            dtype = points_in_object_frame.dtype
+            val = torch.zeros(keys_ravelled.shape, device=device, dtype=dtype)
+            grad = torch.zeros(keys.shape, device=device, dtype=dtype)
+            val[inbound_keys] = voxels.raw_data[keys_ravelled[inbound_keys]]
+            grad[inbound_keys] = voxels_grad[keys_ravelled[inbound_keys]]
 
         points_oob = points_in_object_frame[out_of_bound_keys]
         if out_of_bounds_strategy == OutOfBoundsStrategy.LOOKUP_GT_SDF:
@@ -741,7 +761,7 @@ class CachedSDF(ObjectFrameSDF):
         #     within_bounds = self.voxels.get_valid_values(points_in_object_frame)
         #     assert torch.all(close_enough[within_bounds])
         ctx.save_for_backward(grad)
-        ctx.num_inputs = 7
+        ctx.num_inputs = 8
         return val, grad
 
     def outside_surface(self, points_in_object_frame, surface_level=0):
