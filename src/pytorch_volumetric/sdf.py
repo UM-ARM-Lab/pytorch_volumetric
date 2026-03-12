@@ -12,6 +12,7 @@ import torch
 from torch.autograd import Function
 from arm_pytorch_utilities import tensor_utils, rand
 from multidim_indexing import torch_view
+from multidim_indexing.torch_view import BatchedViewLookup
 from functools import partial
 
 from pytorch_volumetric.voxel import VoxelGrid, get_divisible_range_by_resolution, get_coordinates_and_points_in_grid
@@ -405,10 +406,9 @@ class ComposedSDF(ObjectFrameSDF):
         self.link_frame_to_obj_frame = []
         self.tsf_batch = batch_dim
         # precomputed rotation matrices for transforming gradients back to object frame
-        # link_frame_to_obj_frame[i].transform_normals(g) computes inverse().get_matrix()[:,:3,:3] @ g
-        # which is the rotation part of obj_frame_to_link_frame (since link_frame_to_obj_frame is already inverted)
-        # we precompute these to avoid recomputing the inverse 8 times per query
         self._grad_rotation_mats = []
+        # batched voxel lookup for vectorized CachedSDF queries
+        self._batched_view = None
         # assume a single batch dimension when not given B x N x 4 x 4
         if tsf is not None:
             S = len(self.sdfs)
@@ -419,12 +419,16 @@ class ComposedSDF(ObjectFrameSDF):
             for i in range(S):
                 mi = m[self.ith_transform_slice(i)]
                 self.link_frame_to_obj_frame.append(pk.Transform3d(matrix=mi))
-                # rotation part of link_frame_to_obj_frame: mi[:, :3, :3]
-                # transform_normals computes inverse of that = transpose for rotation matrices
-                # but the inverse of link_frame_to_obj_frame is obj_frame_to_link_frame
-                # so the rotation is tsf.get_matrix()[slice][:, :3, :3]
                 self._grad_rotation_mats.append(
                     tsf.get_matrix()[self.ith_transform_slice(i)][:, :3, :3])
+            self._precompute_batch_lookup()
+
+    def _precompute_batch_lookup(self):
+        """Set up BatchedViewLookup if all SDFs are CachedSDF."""
+        if not all(isinstance(s, CachedSDF) for s in self.sdfs):
+            self._batched_view = None
+            return
+        self._batched_view = BatchedViewLookup([s.voxels for s in self.sdfs])
 
     def ith_transform_slice(self, i):
         if self.tsf_batch is None:
@@ -447,16 +451,47 @@ class ComposedSDF(ObjectFrameSDF):
         pts = self.obj_frame_to_link_frame.transform_points(points_in_object_frame)
         if self.tsf_batch is not None:
             pts = pts.reshape(S, *self.tsf_batch, *flat_shape)
-        sdfv = []
-        for i, sdf in enumerate(self.sdfs):
-            v, _ = sdf(pts[i], compute_grad=False)
-            sdfv.append(v)
-        sdfv = torch.cat(sdfv)
-        v = sdfv.reshape(S, -1)
-        vv = v.min(dim=0).values
+
+        if self._batched_view is not None and self.tsf_batch is None:
+            vv = self._batched_cached_sdf_lookup(pts)
+        else:
+            # fallback: sequential loop (for non-CachedSDF or batched transforms)
+            sdfv = []
+            for i, sdf in enumerate(self.sdfs):
+                v, _ = sdf(pts[i], compute_grad=False)
+                sdfv.append(v)
+            sdfv = torch.cat(sdfv)
+            v = sdfv.reshape(S, -1)
+            vv = v.min(dim=0).values
+
         if self.tsf_batch is not None:
             vv = vv.reshape(*self.tsf_batch, *pts_shape[:-1])
         return vv, None
+
+    def _batched_cached_sdf_lookup(self, pts):
+        """Vectorized CachedSDF lookup across all S links at once.
+        pts: (S, N, 3) points already in each link's frame.
+        Returns: (N,) min SDF values across all links."""
+        # batched voxel grid lookup — returns (S, N) values and (S, N) validity mask
+        val, valid = self._batched_view(pts)
+
+        # handle out-of-bounds points per the CachedSDF strategy
+        oob = ~valid
+        if oob.any():
+            oob_strategy = self.sdfs[0].out_of_bounds_strategy
+            if oob_strategy == OutOfBoundsStrategy.BOUNDING_BOX:
+                bb = torch.stack([s.bb for s in self.sdfs]).to(dtype=pts.dtype)  # (S, 3, 2)
+                dmin = (bb[:, :, 0][:, None, :] - pts).clamp(min=0)
+                dmax = (pts - bb[:, :, 1][:, None, :]).clamp(min=0)
+                oob_dist = (dmin + dmax).norm(dim=-1)  # (S, N)
+                val[oob] = oob_dist[oob]
+            elif oob_strategy == OutOfBoundsStrategy.LOOKUP_GT_SDF:
+                for i, sdf_i in enumerate(self.sdfs):
+                    oob_i = oob[i]
+                    if oob_i.any():
+                        val[i, oob_i], _ = sdf_i.gt_sdf(pts[i, oob_i], compute_grad=False)
+
+        return val.min(dim=0).values
 
     @staticmethod
     def forward(ctx, points_in_object_frame, sdfs, obj_frame_to_link_frame, tsf_batch, grad_rotation_mats):
