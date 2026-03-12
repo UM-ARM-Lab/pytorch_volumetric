@@ -10,6 +10,33 @@ SDF slice animated over a KUKA robot
 ![pv_sdf_slice](https://github.com/user-attachments/assets/d9081706-6463-4716-82ec-b278969d24f4)
 
 
+## Performance
+
+SDF query benchmarks for a YCB power drill mesh (resolution 0.01). Measured with `pytest-benchmark`.
+
+**GPU (CUDA, RTX 3090):**
+
+| Benchmark | 100 pts | 1K pts | 5K pts | 20K pts | 100K pts |
+|---|---|---|---|---|---|
+| MeshSDF | 0.89 ms | 6.9 ms | 5.8 ms | 20.9 ms | 91 ms |
+| CachedSDF (bounding box) | 0.49 ms | 0.51 ms | 0.53 ms | 0.55 ms | **0.70 ms** |
+| CachedSDF (GT fallback) | 0.64 ms | 0.67 ms | 0.70 ms | 0.71 ms | **0.84 ms** |
+| MeshSDF + backward | 1.07 ms | 7.1 ms | 6.0 ms | 21.0 ms | 91 ms |
+
+**CPU (Apple M3 Max):**
+
+| Benchmark | 100 pts | 1K pts | 5K pts | 20K pts | 100K pts |
+|---|---|---|---|---|---|
+| MeshSDF | 193 us | 3.1 ms | 3.7 ms | 11.9 ms | 57.6 ms |
+| CachedSDF (bounding box) | 64 us | 112 us | 353 us | 854 us | **2.6 ms** |
+| CachedSDF (GT fallback) | 97 us | 143 us | 396 us | 902 us | **2.7 ms** |
+| MeshSDF + backward | 239 us | 3.2 ms | 3.8 ms | 12.3 ms | 58.3 ms |
+
+CachedSDF provides **22-130x speedup** over MeshSDF. At 100K points, CachedSDF queries
+complete in **0.70 ms on GPU** and **2.6 ms on CPU**, compared to 92 ms and 57.6 ms for MeshSDF.
+
+Run benchmarks yourself with `pytest tests/test_benchmarks.py -v`.
+
 ## Installation
 
 ```shell
