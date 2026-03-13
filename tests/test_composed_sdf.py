@@ -120,6 +120,15 @@ def test_composed_flat_query_values():
     assert g.shape == (100, 3)
 
 
+def _make_batched_sphere_transforms(S, B, device):
+    """Helper: create B configs for S spheres, with SDF i at x = (i+1)*(b+1)."""
+    matrices = torch.eye(4, device=device).unsqueeze(0).repeat(B * S, 1, 1)
+    for b in range(B):
+        matrices[0 * B + b, 0, 3] = -(b + 1.0)
+        matrices[1 * B + b, 0, 3] = (b + 1.0)
+    return matrices
+
+
 def test_composed_batch_transforms():
     """Test ComposedSDF with batched transforms (multiple configurations)."""
     d = "cuda" if torch.cuda.is_available() else "cpu"
@@ -129,12 +138,7 @@ def test_composed_batch_transforms():
     # Layout: S interleaved with B, i.e. [sdf0_cfg0, sdf0_cfg1, sdf0_cfg2, sdf1_cfg0, sdf1_cfg1, sdf1_cfg2]
     B = 3
     S = 2
-    matrices = torch.eye(4, device=d).unsqueeze(0).repeat(B * S, 1, 1)
-    # SDF 0 (left sphere): configs at x = -1, -2, -3
-    # SDF 1 (right sphere): configs at x = +1, +2, +3
-    for b in range(B):
-        matrices[0 * B + b, 0, 3] = -(b + 1.0)
-        matrices[1 * B + b, 0, 3] = (b + 1.0)
+    matrices = _make_batched_sphere_transforms(S, B, d)
 
     tsf = pk.Transform3d(matrix=matrices, device=d)
     composed = pv.ComposedSDF(sdfs, None)
@@ -149,6 +153,58 @@ def test_composed_batch_transforms():
     for b in range(B):
         expected_dist = (b + 1.0) - 0.5
         assert torch.allclose(v[b, 0], torch.tensor(expected_dist, device=d), atol=1e-5)
+
+
+def test_composed_batch_transforms_no_grad():
+    """Batched transforms with compute_grad=False should match with-grad values."""
+    d = "cuda" if torch.cuda.is_available() else "cpu"
+    sdfs = [pv.SphereSDF(0.5), pv.SphereSDF(0.5)]
+    B = 3
+    S = 2
+    matrices = _make_batched_sphere_transforms(S, B, d)
+
+    tsf = pk.Transform3d(matrix=matrices, device=d)
+    composed = pv.ComposedSDF(sdfs, None)
+    composed.set_transforms(tsf, batch_dim=(B,))
+
+    pts = torch.randn(50, 3, device=d)
+    v_grad, g_grad = composed(pts, compute_grad=True)
+    v_no_grad, g_no_grad = composed(pts, compute_grad=False)
+
+    assert v_no_grad.shape == v_grad.shape
+    assert torch.allclose(v_no_grad, v_grad, atol=1e-5)
+    assert g_no_grad is None
+
+
+def test_composed_batch_transforms_matches_sequential():
+    """Batched-config query should match running each config individually."""
+    d = "cuda" if torch.cuda.is_available() else "cpu"
+    sdfs_batched = [pv.SphereSDF(0.5), pv.SphereSDF(0.5)]
+    B = 4
+    S = 2
+    matrices = _make_batched_sphere_transforms(S, B, d)
+
+    tsf = pk.Transform3d(matrix=matrices, device=d)
+    composed = pv.ComposedSDF(sdfs_batched, None)
+    composed.set_transforms(tsf, batch_dim=(B,))
+
+    pts = torch.randn(100, 3, device=d)
+
+    # Batched result
+    v_batched, g_batched = composed(pts)
+    assert v_batched.shape == (B, 100)
+
+    # Sequential: run each config individually and compare
+    for b in range(B):
+        sdfs_single = [pv.SphereSDF(0.5), pv.SphereSDF(0.5)]
+        single_matrices = torch.stack([matrices[0 * B + b], matrices[1 * B + b]])
+        single_tsf = pk.Transform3d(matrix=single_matrices, device=d)
+        single_composed = pv.ComposedSDF(sdfs_single, None)
+        single_composed.set_transforms(single_tsf)
+
+        v_single, g_single = single_composed(pts)
+        assert torch.allclose(v_batched[b], v_single.squeeze(), atol=1e-5), f"Config {b} mismatch"
+        assert torch.allclose(g_batched[b], g_single.squeeze(), atol=1e-5), f"Config {b} grad mismatch"
 
 
 # ── Differentiability ─────────────────────────────────────────────────────────

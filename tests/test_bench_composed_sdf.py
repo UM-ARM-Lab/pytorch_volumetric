@@ -160,3 +160,107 @@ def test_bench_step_argmin_gather(benchmark, composed_internals, device):
             torch.cuda.synchronize()
 
     benchmark(do_argmin)
+
+
+# ── Batched configuration benchmarks (planning use case) ─────────────────────
+
+@pytest.fixture(scope="module")
+def robot_sdf_obj(device):
+    """Full RobotSDF object (needed for set_joint_configuration)."""
+    pybullet_data = pytest.importorskip("pybullet_data")
+    search_path = pybullet_data.getDataPath()
+    urdf = os.path.join(search_path, "kuka_iiwa/model.urdf")
+    chain = pk.build_serial_chain_from_urdf(open(urdf).read(), "lbr_iiwa_link_7")
+    chain = chain.to(device=device)
+    return pv.RobotSDF(chain, path_prefix=os.path.join(search_path, "kuka_iiwa"),
+                        link_sdf_cls=pv.cache_link_sdf_factory(resolution=0.02, padding=1.0, device=device))
+
+
+def _set_batch_config(robot_sdf, n_configs, device):
+    """Set batched joint configurations (including FK)."""
+    th_base = torch.tensor([0.0, -math.pi / 4.0, 0.0, math.pi / 2.0, 0.0, math.pi / 4.0, 0.0], device=device)
+    th = th_base.unsqueeze(0) + torch.randn(n_configs, 7, device=device) * 0.1
+    robot_sdf.set_joint_configuration(th)
+
+
+@pytest.mark.parametrize("n_configs,n_points", [
+    (10, 1000),
+    (10, 10000),
+    (100, 1000),
+    (100, 10000),
+    (500, 1000),
+    (500, 10000),
+    (500, 100000),
+])
+def test_bench_batched_config_no_grad(benchmark, robot_sdf_obj, device, n_configs, n_points):
+    """Batched configs (planning): B configs x N points, no gradient."""
+    _set_batch_config(robot_sdf_obj, n_configs, device)
+    pts = torch.randn(n_points, 3, device=device) * 0.5
+    benchmark(robot_sdf_obj, pts, compute_grad=False)
+
+
+@pytest.mark.parametrize("n_configs,n_points", [
+    (10, 1000),
+    (10, 10000),
+    (100, 1000),
+    (100, 10000),
+    (500, 1000),
+    (500, 10000),
+    (500, 100000),
+])
+def test_bench_batched_config_with_grad(benchmark, robot_sdf_obj, device, n_configs, n_points):
+    """Batched configs (planning): B configs x N points, with gradient."""
+    _set_batch_config(robot_sdf_obj, n_configs, device)
+    pts = torch.randn(n_points, 3, device=device) * 0.5
+    benchmark(robot_sdf_obj, pts)
+
+
+@pytest.mark.parametrize("n_configs", [10, 50, 100, 500])
+def test_bench_batched_config_fk_and_set_transforms(benchmark, robot_sdf_obj, device, n_configs):
+    """Benchmark FK + set_transforms overhead for batched configs (amortized cost)."""
+    th_base = torch.tensor([0.0, -math.pi / 4.0, 0.0, math.pi / 2.0, 0.0, math.pi / 4.0, 0.0], device=device)
+    th = th_base.unsqueeze(0) + torch.randn(n_configs, 7, device=device) * 0.1
+    benchmark(robot_sdf_obj.set_joint_configuration, th)
+
+
+# ── Batched config breakdown benchmarks ──────────────────────────────────────
+
+@pytest.fixture(scope="module")
+def batched_internals(robot_sdf_obj, device):
+    """Pre-compute batched-config data for step benchmarks."""
+    B = 500
+    _set_batch_config(robot_sdf_obj, B, device)
+    composed = robot_sdf_obj.sdf
+    N = 10000
+    pts = torch.randn(N, 3, device=device) * 0.5
+    return composed, pts, B
+
+
+def test_bench_batched_step_transform_points(benchmark, batched_internals, device):
+    """Benchmark: transform N points across S*B transforms."""
+    composed, pts, B = batched_internals
+    pts_flat = pts.view(-1, 3)
+
+    def do_transform():
+        composed.obj_frame_to_link_frame.transform_points(pts_flat)
+        if device == "cuda":
+            torch.cuda.synchronize()
+
+    benchmark(do_transform)
+
+
+def test_bench_batched_step_per_link_sdf(benchmark, batched_internals, device):
+    """Benchmark: sequential CachedSDF queries across S links, B*N points each."""
+    composed, pts, B = batched_internals
+    pts_flat = pts.view(-1, 3)
+    S = len(composed.sdfs)
+    transformed = composed.obj_frame_to_link_frame.transform_points(pts_flat)
+    transformed = transformed.reshape(S, B, *pts_flat.shape)
+
+    def do_sdf_queries():
+        for i, sdf_i in enumerate(composed.sdfs):
+            sdf_i(transformed[i].reshape(-1, 3), compute_grad=False)
+        if device == "cuda":
+            torch.cuda.synchronize()
+
+    benchmark(do_sdf_queries)
