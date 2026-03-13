@@ -448,13 +448,65 @@ class ComposedSDF(ObjectFrameSDF):
         points_in_object_frame = points_in_object_frame.view(-1, 3)
         flat_shape = points_in_object_frame.shape
         S = len(self.sdfs)
-        pts = self.obj_frame_to_link_frame.transform_points(points_in_object_frame)
-        if self.tsf_batch is not None:
-            pts = pts.reshape(S, *self.tsf_batch, *flat_shape)
 
-        if self._batched_view is not None and self.tsf_batch is None:
+        if self._batched_view is not None and self.tsf_batch is not None:
+            # Batched-config path: B joint configurations × N query points.
+            #
+            # The naive approach (obj_frame_to_link_frame.transform_points) broadcasts
+            # (N,3) points across all S*B transforms at once, allocating an (S*B, N, 4)
+            # intermediate for the bmm. At S=8, B=500, N=100K this is ~6GB and OOMs on
+            # typical GPUs.
+            #
+            # Instead, we:
+            # 1. Loop over S links (small, =8), transforming (B, N) points per link
+            # 2. Chunk over B configs to bound peak memory from BatchedViewLookup
+            #    intermediates (idx, valid, flat_idx, etc. are all S × chunk*N)
+            # 3. Use BatchedViewLookup for vectorized voxel grid queries instead of
+            #    the sequential Python loop over S links
+            N = points_in_object_frame.shape[0]
+            ones = torch.ones(N, 1, dtype=points_in_object_frame.dtype,
+                              device=points_in_object_frame.device)
+            # Homogeneous coordinates, precomputed once and reused across all chunks
+            pts_h = torch.cat([points_in_object_frame, ones], dim=1)  # (N, 4)
+            pts_h_T = pts_h.T  # (4, N) — transposed for right-multiply with (B, 4, 4)
+            # Transform matrices laid out as [link0_cfg0, ..., link0_cfgB-1, link1_cfg0, ...]
+            all_mats = self.obj_frame_to_link_frame.get_matrix()  # (S*B, 4, 4)
+            B = math.prod(self.tsf_batch)
+            # Choose chunk size to keep BatchedViewLookup intermediates under ~256MB.
+            # The lookup allocates ~10 tensors of shape (S, chunk*N): idx, flat_idx,
+            # valid, values, global_idx, etc.
+            bytes_per_float = 4 if pts_h.dtype == torch.float32 else 8
+            max_elements = (256 * 1024 ** 2) // (S * bytes_per_float)
+            chunk_size = max(1, max_elements // N)
+            chunk_size = min(chunk_size, B)
+
+            vv_chunks = []
+            for b_start in range(0, B, chunk_size):
+                b_end = min(b_start + chunk_size, B)
+                Bc = b_end - b_start
+                # Transform points per-link: (Bc, 4, 4) @ (Bc, 4, N) → (Bc, 3, N)
+                # Peak memory per iteration: Bc*N*4 floats (vs S*B*N*4 for the naive path)
+                pts_per_link = []
+                for i in range(S):
+                    full_slice = self.ith_transform_slice(i)
+                    mat_i = all_mats[full_slice.start + b_start:full_slice.start + b_end]  # (Bc, 4, 4)
+                    transformed = torch.bmm(mat_i, pts_h_T.unsqueeze(0).expand(Bc, -1, -1))
+                    # (Bc, 4, N) → (Bc, N, 3) → (Bc*N, 3): flatten configs into point dim
+                    pts_per_link.append(transformed[:, :3, :].permute(0, 2, 1).reshape(-1, 3))
+                # (S, Bc*N, 3) — BatchedViewLookup expects (S, M, D) where M = Bc*N
+                chunk_pts = torch.stack(pts_per_link)
+                vv_chunks.append(self._batched_cached_sdf_lookup(chunk_pts))
+            # Reassemble: each chunk returns (Bc*N,), concatenate to (B*N,)
+            vv = torch.cat(vv_chunks)
+        elif self._batched_view is not None:
+            # Single-config path: no batching over configurations
+            # transform_points broadcasts (N,3) across S transforms → (S, N, 3)
+            pts = self.obj_frame_to_link_frame.transform_points(points_in_object_frame)
             vv = self._batched_cached_sdf_lookup(pts)
         else:
+            pts = self.obj_frame_to_link_frame.transform_points(points_in_object_frame)
+            if self.tsf_batch is not None:
+                pts = pts.reshape(S, *self.tsf_batch, *flat_shape)
             # fallback: sequential loop (for non-CachedSDF or batched transforms)
             sdfv = []
             for i, sdf in enumerate(self.sdfs):
