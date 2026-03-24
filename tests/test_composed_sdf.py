@@ -433,11 +433,12 @@ def test_composed_cached_single_config_values():
     offsets = [-3.0, 3.0]
     composed = _make_composed_cached_spheres(2, offsets, device=d)
 
-    # Point near left sphere
+    # Point near left sphere — query the same CachedSDF instance directly
     pt = torch.tensor([[-2.6, 0.0, 0.0]], device=d)
     v, _ = composed(pt, compute_grad=False)
-    v_direct, _ = _make_cached_sphere(device=d)(pt - torch.tensor([[-3.0, 0, 0]], device=d))
-    assert torch.allclose(v.squeeze(), v_direct.squeeze(), atol=0.02)
+    pt_in_left_frame = pt - torch.tensor([[-3.0, 0, 0]], device=d)
+    v_direct, _ = composed.sdfs[0](pt_in_left_frame, compute_grad=False)
+    assert torch.allclose(v.squeeze(), v_direct.squeeze(), atol=1e-6)
 
 
 def test_composed_cached_oob_handling():
@@ -478,7 +479,7 @@ def test_composed_cached_batched_config_no_grad():
     v_no_grad, _ = composed(pts, compute_grad=False)
 
     assert v_no_grad.shape == v_grad.shape == (B, 50)
-    assert torch.allclose(v_grad, v_no_grad, atol=0.02)
+    assert torch.allclose(v_grad, v_no_grad, atol=1e-6)
 
 
 def test_composed_cached_batched_config_matches_sequential():
@@ -491,22 +492,21 @@ def test_composed_cached_batched_config_matches_sequential():
         matrices[0 * B + b, 0, 3] = -(b + 1.0)
         matrices[1 * B + b, 0, 3] = (b + 1.0)
 
-    # Batched query
-    sdfs_batched = [_make_cached_sphere(device=d) for _ in range(S)]
-    composed = pv.ComposedSDF(sdfs_batched, None)
-    composed.set_transforms(pk.Transform3d(matrix=matrices, device=d), batch_dim=(B,))
+    # Shared SDFs — same instances for batched and sequential
+    sdfs = [_make_cached_sphere(device=d) for _ in range(S)]
+    composed = pv.ComposedSDF(sdfs, None)
 
+    # Batched query
+    composed.set_transforms(pk.Transform3d(matrix=matrices, device=d), batch_dim=(B,))
     pts = torch.randn(100, 3, device=d) * 0.3
     v_batched, _ = composed(pts, compute_grad=False)
 
-    # Sequential: run each config individually
+    # Sequential: reuse same ComposedSDF, change transforms per config
     for b in range(B):
-        sdfs_single = [_make_cached_sphere(device=d) for _ in range(S)]
         single_matrices = torch.stack([matrices[0 * B + b], matrices[1 * B + b]])
-        single_composed = pv.ComposedSDF(sdfs_single, None)
-        single_composed.set_transforms(pk.Transform3d(matrix=single_matrices, device=d))
+        composed.set_transforms(pk.Transform3d(matrix=single_matrices, device=d))
 
-        v_single, _ = single_composed(pts, compute_grad=False)
+        v_single, _ = composed(pts, compute_grad=False)
         assert torch.allclose(v_batched[b], v_single.squeeze(), atol=1e-5), f"Config {b} mismatch"
 
 
@@ -698,29 +698,25 @@ def test_composed_mixed_meshes_batched_config():
         matrices[0 * B + b, 0, 3] = -(b + 1) * 0.1  # L-shape shifts left
         matrices[1 * B + b, 0, 3] = (b + 1) * 0.1   # capsule shifts right
 
-    # Batched
-    sdfs_batched = [_make_cached_mesh("L_shape.obj", device=d),
-                    _make_cached_mesh("capsule.obj", device=d)]
-    composed = pv.ComposedSDF(sdfs_batched, None)
-    composed.set_transforms(pk.Transform3d(matrix=matrices, device=d), batch_dim=(B,))
+    # Shared SDFs — same instances used for batched and sequential to avoid grid alignment diffs
+    sdfs = [_make_cached_mesh("L_shape.obj", device=d),
+            _make_cached_mesh("capsule.obj", device=d)]
+    composed = pv.ComposedSDF(sdfs, None)
 
+    # Batched
+    composed.set_transforms(pk.Transform3d(matrix=matrices, device=d), batch_dim=(B,))
     pts = torch.randn(50, 3, device=d) * 0.05
     v_batched, _ = composed(pts, compute_grad=False)
     assert v_batched.shape == (B, 50)
 
-    # Sequential
+    # Sequential: reuse the same ComposedSDF, just change transforms per config
     for b in range(B):
-        sdfs_single = [_make_cached_mesh("L_shape.obj", device=d),
-                       _make_cached_mesh("capsule.obj", device=d)]
         single_matrices = torch.stack([matrices[0 * B + b], matrices[1 * B + b]])
-        single_composed = pv.ComposedSDF(sdfs_single, None)
-        single_composed.set_transforms(pk.Transform3d(matrix=single_matrices, device=d))
+        composed.set_transforms(pk.Transform3d(matrix=single_matrices, device=d))
 
-        v_single, _ = single_composed(pts, compute_grad=False)
-        # Separate CachedSDF instances may have slightly different voxel grid alignment,
-        # causing nearest-neighbor boundary differences up to ~resolution at grid edges.
-        assert torch.allclose(v_batched[b], v_single.squeeze(), atol=0.05), \
-            f"Config {b}: max diff {(v_batched[b] - v_single.squeeze()).abs().max():.4f}"
+        v_single, _ = composed(pts, compute_grad=False)
+        assert torch.allclose(v_batched[b], v_single.squeeze(), atol=1e-5), \
+            f"Config {b}: max diff {(v_batched[b] - v_single.squeeze()).abs().max():.6f}"
 
 
 def test_composed_mixed_meshes_differentiability():
@@ -830,9 +826,8 @@ def test_robot_sdf_batched_config_matches_sequential():
     for b in range(B):
         robot.set_joint_configuration(th[b])
         v_single, _ = robot(pts, compute_grad=False)
-        max_diff = (v_batched[b] - v_single).abs().max()
-        # Small diffs at voxel boundaries due to floating-point transform differences
-        assert max_diff < 0.02, f"Config {b}: max diff {max_diff:.4f}"
+        assert torch.allclose(v_batched[b], v_single, atol=1e-5), \
+            f"Config {b}: max diff {(v_batched[b] - v_single).abs().max():.6f}"
 
 
 def test_robot_sdf_config_change():
