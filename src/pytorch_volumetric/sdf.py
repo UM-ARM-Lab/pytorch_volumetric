@@ -374,8 +374,13 @@ class ComposedSDF(ObjectFrameSDF):
         """
         self.sdfs = sdfs
         self.obj_frame_to_link_frame: typing.Optional[pk.Transform3d] = None
-        self.link_frame_to_obj_frame: typing.Optional[typing.Sequence[pk.Transform3d]] = None
         self.tsf_batch = None
+        # BatchedViewLookup only depends on the voxel grids, which don't change —
+        # create once rather than on every set_transforms call.
+        if all(isinstance(s, CachedSDF) and s.method == 'nearest' for s in sdfs):
+            self._batched_view = BatchedViewLookup([s.voxels for s in sdfs])
+        else:
+            self._batched_view = None
         self.set_transforms(obj_frame_to_each_frame)
 
     def surface_bounding_box(self, **kwargs):
@@ -403,32 +408,30 @@ class ComposedSDF(ObjectFrameSDF):
 
     def set_transforms(self, tsf: pk.Transform3d, batch_dim=None):
         self.obj_frame_to_link_frame = tsf
-        self.link_frame_to_obj_frame = []
         self.tsf_batch = batch_dim
-        # precomputed rotation matrices for transforming gradients back to object frame
-        self._grad_rotation_mats = []
-        # batched voxel lookup for vectorized CachedSDF queries
-        self._batched_view = None
+        # Lazily computed on first access (avoids S*B matrix inverse for no-grad callers)
+        self.link_frame_to_obj_frame = None
+        self._grad_rotation_mats = None
         # assume a single batch dimension when not given B x N x 4 x 4
         if tsf is not None:
             S = len(self.sdfs)
             S_tsf = len(self.obj_frame_to_link_frame)
             if self.tsf_batch is None and (S_tsf != S):
                 self.tsf_batch = (S_tsf / S,)
-            m = tsf.get_matrix().inverse()
-            for i in range(S):
-                mi = m[self.ith_transform_slice(i)]
-                self.link_frame_to_obj_frame.append(pk.Transform3d(matrix=mi))
-                self._grad_rotation_mats.append(
-                    tsf.get_matrix()[self.ith_transform_slice(i)][:, :3, :3])
-            self._precompute_batch_lookup()
 
-    def _precompute_batch_lookup(self):
-        """Set up BatchedViewLookup if all SDFs are CachedSDF with nearest-neighbor interpolation."""
-        if not all(isinstance(s, CachedSDF) and s.method == 'nearest' for s in self.sdfs):
-            self._batched_view = None
+    def _ensure_inverse_transforms(self):
+        """Lazily compute inverse transforms and rotation matrices."""
+        if self._grad_rotation_mats is not None:
             return
-        self._batched_view = BatchedViewLookup([s.voxels for s in self.sdfs])
+        S = len(self.sdfs)
+        m = self.obj_frame_to_link_frame.get_matrix()
+        m_inv = m.inverse()
+        self.link_frame_to_obj_frame = []
+        self._grad_rotation_mats = []
+        for i in range(S):
+            sl = self.ith_transform_slice(i)
+            self.link_frame_to_obj_frame.append(pk.Transform3d(matrix=m_inv[sl]))
+            self._grad_rotation_mats.append(m[sl][:, :3, :3])
 
     def ith_transform_slice(self, i):
         if self.tsf_batch is None:
@@ -439,6 +442,7 @@ class ComposedSDF(ObjectFrameSDF):
 
     def __call__(self, points_in_object_frame, compute_grad=True):
         if compute_grad:
+            self._ensure_inverse_transforms()
             return self.apply(points_in_object_frame, self.sdfs, self.obj_frame_to_link_frame, self.tsf_batch,
                               self._grad_rotation_mats)
         return self._forward_no_grad(points_in_object_frame)
@@ -471,13 +475,11 @@ class ComposedSDF(ObjectFrameSDF):
                 Bc = b_end - b_start
                 min_val = None
                 for i in range(S):
-                    # Transform: R @ pts + t, avoiding homogeneous coords
                     mat_i = all_mats[i, b_start:b_end]  # (Bc, 4, 4)
                     R_i = mat_i[:, :3, :3]  # (Bc, 3, 3)
                     t_i = mat_i[:, :3, 3:]  # (Bc, 3, 1)
                     # (Bc, 3, 3) @ (3, N) + (Bc, 3, 1) → (Bc, 3, N) → (Bc, N, 3) → (Bc*N, 3)
                     transformed = (R_i @ pts_3 + t_i).permute(0, 2, 1).reshape(-1, 3)
-                    # Per-link CachedSDF lookup (no grad)
                     val_i, _ = self.sdfs[i](transformed, compute_grad=False)
                     if min_val is None:
                         min_val = val_i
@@ -691,34 +693,31 @@ class CachedSDF(ObjectFrameSDF):
 
     def _forward_no_grad(self, points_in_object_frame):
         if self.method == 'linear':
-            # use TorchMultidimView.__getitem__ which handles trilinear interpolation
-            # the view's invalid_value callback handles OOB points
             val = self.voxels[points_in_object_frame]
             return val, None
 
-        # nearest-neighbor fast path: manual index computation
-        keys = self.voxels.ensure_index_key(points_in_object_frame)
-        keys_ravelled = self.voxels.ravel_multi_index(keys, self.voxels.shape)
+        # Nearest-neighbor: fused bounds check + coord conversion + clamped gather.
+        # Single pass over points instead of separate ensure_index_key / ravel / get_valid_values.
+        # Uses clamped unconditional gather instead of boolean-indexed gather.
+        v = self.voxels
+        pts = points_in_object_frame.reshape(-1, 3)
+        valid = ((pts >= v._min) & (pts <= v._max)).all(dim=-1)
+        idx = ((pts - v._min) * v._inv_resolution).round().long()
+        flat_idx = (idx * v._ravel_coefs).sum(dim=-1).clamp(min=0, max=v._d.shape[0] - 1)
+        val = v._d[flat_idx]
 
-        inbound_keys = self.voxels.get_valid_values(points_in_object_frame)
-        out_of_bound_keys = ~inbound_keys
-
-        dtype = points_in_object_frame.dtype
-        val = torch.zeros(keys_ravelled.shape, device=self.device, dtype=dtype)
-        val[inbound_keys] = self.voxels.raw_data[keys_ravelled[inbound_keys]]
-
-        points_oob = points_in_object_frame[out_of_bound_keys]
-        if self.out_of_bounds_strategy == OutOfBoundsStrategy.LOOKUP_GT_SDF:
-            val[out_of_bound_keys], _ = self.gt_sdf(points_oob, compute_grad=False)
-        elif self.out_of_bounds_strategy == OutOfBoundsStrategy.BOUNDING_BOX:
-            bb = self.bb
-            if bb.dtype != dtype:
-                bb = bb.to(dtype=dtype)
-            dmin = bb[:, 0] - points_oob
-            dmin[dmin < 0] = 0
-            dmax = points_oob - bb[:, 1]
-            dmax[dmax < 0] = 0
-            val[out_of_bound_keys] = (dmin + dmax).norm(dim=-1)
+        if not valid.all():
+            oob = ~valid
+            if self.out_of_bounds_strategy == OutOfBoundsStrategy.LOOKUP_GT_SDF:
+                val[oob], _ = self.gt_sdf(pts[oob], compute_grad=False)
+            elif self.out_of_bounds_strategy == OutOfBoundsStrategy.BOUNDING_BOX:
+                bb = self.bb
+                if bb.dtype != pts.dtype:
+                    bb = bb.to(dtype=pts.dtype)
+                pts_oob = pts[oob]
+                dmin = (bb[:, 0] - pts_oob).clamp(min=0)
+                dmax = (pts_oob - bb[:, 1]).clamp(min=0)
+                val[oob] = (dmin + dmax).norm(dim=-1)
 
         return val, None
 

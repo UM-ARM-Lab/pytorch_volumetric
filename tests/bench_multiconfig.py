@@ -1,6 +1,7 @@
 """
-Benchmark script comparing batched-config no-grad approaches.
-Measures both runtime and peak memory for the multi-config planning use case.
+Benchmark script for batched-config no-grad SDF queries.
+Measures runtime and peak memory for the multi-config planning use case.
+Tests both scattered and localized query points to evaluate AABB rejection.
 
 Run: python tests/bench_multiconfig.py [--device cuda]
 """
@@ -62,6 +63,39 @@ def measure(fn, warmup=3, repeats=10, device="cpu"):
     return mean, std, peak_mem
 
 
+def make_localized_points(robot_sdf, n_points, device):
+    """Generate points localized near the end effector (link 7)."""
+    # Get end-effector position from FK with a single config
+    th = torch.tensor([[0.0, -math.pi / 4.0, 0.0, math.pi / 2.0, 0.0, math.pi / 4.0, 0.0]], device=device)
+    fk = robot_sdf.chain.forward_kinematics(th)
+    ee_pos = fk.get_matrix()[0, :3, 3]
+    # Small cube (0.1m) around end effector
+    pts = ee_pos + (torch.rand(n_points, 3, device=device) - 0.5) * 0.1
+    return pts
+
+
+def run_benchmark(robot, configs, pts_factory, label, device):
+    print(f"\n--- {label} ---")
+    print(f"{'B':>6} x {'N':>6} | {'Time (ms)':>12} | {'Std (ms)':>10} | {'Per-cfg (ms)':>13} | {'Peak MB':>10}")
+    print("-" * 75)
+
+    for B, N in configs:
+        pts = pts_factory(N)
+        torch.manual_seed(42)
+        set_batch_config(robot, B, device)
+
+        try:
+            mean, std, peak = measure(lambda: robot(pts, compute_grad=False), device=device)
+            print(f"{B:>6} x {N:>6} | {mean:>12.1f} | {std:>10.1f} | {mean/B:>13.3f} | {peak:>10.1f}")
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                print(f"{B:>6} x {N:>6} | {'OOM':>12} |")
+                if device == "cuda":
+                    torch.cuda.empty_cache()
+            else:
+                raise
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", default="cpu")
@@ -85,24 +119,15 @@ def main():
         (5000, 1000),
     ]
 
-    print(f"\n{'B':>6} x {'N':>6} | {'Time (ms)':>12} | {'Std (ms)':>10} | {'Per-cfg (ms)':>13} | {'Peak MB':>10}")
-    print("-" * 75)
+    # Scattered points: 0.5m std around origin (covers whole workspace)
+    run_benchmark(robot, configs,
+                  lambda n: torch.randn(n, 3, device=device) * 0.5,
+                  "Scattered points (0.5m std)", device)
 
-    for B, N in configs:
-        pts = torch.randn(N, 3, device=device) * 0.5
-        torch.manual_seed(42)
-        set_batch_config(robot, B, device)
-
-        try:
-            mean, std, peak = measure(lambda: robot(pts, compute_grad=False), device=device)
-            print(f"{B:>6} x {N:>6} | {mean:>12.1f} | {std:>10.1f} | {mean/B:>13.3f} | {peak:>10.1f}")
-        except RuntimeError as e:
-            if "out of memory" in str(e).lower():
-                print(f"{B:>6} x {N:>6} | {'OOM':>12} |")
-                if device == "cuda":
-                    torch.cuda.empty_cache()
-            else:
-                raise
+    # Localized points: 0.1m cube near end effector
+    run_benchmark(robot, configs,
+                  lambda n: make_localized_points(robot, n, device),
+                  "Localized points (0.1m cube near EE)", device)
 
 
 if __name__ == "__main__":
