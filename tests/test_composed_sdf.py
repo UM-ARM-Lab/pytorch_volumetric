@@ -717,8 +717,9 @@ def test_composed_mixed_meshes_batched_config():
         single_composed.set_transforms(pk.Transform3d(matrix=single_matrices, device=d))
 
         v_single, _ = single_composed(pts, compute_grad=False)
-        # Tolerance accounts for nearest-neighbor boundary differences between CachedSDF instances
-        assert torch.allclose(v_batched[b], v_single.squeeze(), atol=0.01), \
+        # Separate CachedSDF instances may have slightly different voxel grid alignment,
+        # causing nearest-neighbor boundary differences up to ~resolution at grid edges.
+        assert torch.allclose(v_batched[b], v_single.squeeze(), atol=0.05), \
             f"Config {b}: max diff {(v_batched[b] - v_single.squeeze()).abs().max():.4f}"
 
 
@@ -734,3 +735,145 @@ def test_composed_mixed_meshes_differentiability():
     v.sum().backward()
     assert pts.grad is not None
     assert torch.allclose(pts.grad, g, atol=1e-4)
+
+
+# ── RobotSDF tests (full pipeline: URDF → FK → ComposedSDF → CachedSDF) ────
+
+KUKA_URDF = os.path.join(MESH_DIR, "kuka_iiwa", "model.urdf")
+KUKA_MESH_PREFIX = os.path.join(MESH_DIR, "kuka_iiwa")
+
+
+def _make_kuka_robot(device="cpu", resolution=0.02, padding=1.0):
+    """Build a RobotSDF from the local kuka_iiwa URDF and meshes."""
+    chain = pk.build_serial_chain_from_urdf(open(KUKA_URDF).read(), "lbr_iiwa_link_7")
+    chain = chain.to(device=device)
+    return pv.RobotSDF(chain, path_prefix=KUKA_MESH_PREFIX,
+                        link_sdf_cls=pv.cache_link_sdf_factory(resolution=resolution, padding=padding,
+                                                                device=device))
+
+
+def _kuka_base_config(device="cpu"):
+    return torch.tensor([0.0, -torch.pi / 4, 0.0, torch.pi / 2, 0.0, torch.pi / 4, 0.0], device=device)
+
+
+def test_robot_sdf_single_config_no_grad():
+    """RobotSDF single config no-grad: returns valid SDF values."""
+    d = "cuda" if torch.cuda.is_available() else "cpu"
+    robot = _make_kuka_robot(device=d)
+    robot.set_joint_configuration(_kuka_base_config(d))
+
+    pts = torch.randn(500, 3, device=d) * 0.5
+    v, g = robot(pts, compute_grad=False)
+    assert v.shape == (500,)
+    assert g is None
+    # Some points should be near the robot (small positive or negative SDF)
+    assert v.min() < 0.5
+
+
+def test_robot_sdf_no_grad_matches_with_grad():
+    """RobotSDF: no-grad values should match with-grad values."""
+    d = "cuda" if torch.cuda.is_available() else "cpu"
+    robot = _make_kuka_robot(device=d)
+    robot.set_joint_configuration(_kuka_base_config(d))
+
+    pts = torch.randn(200, 3, device=d) * 0.3
+    v_grad, g_grad = robot(pts, compute_grad=True)
+    v_no_grad, _ = robot(pts, compute_grad=False)
+
+    assert torch.allclose(v_grad, v_no_grad, atol=1e-6)
+    assert g_grad.shape == (200, 3)
+
+
+def test_robot_sdf_differentiability():
+    """RobotSDF: autograd backward produces gradients matching SDF gradient."""
+    d = "cuda" if torch.cuda.is_available() else "cpu"
+    robot = _make_kuka_robot(device=d)
+    robot.set_joint_configuration(_kuka_base_config(d))
+
+    pts = torch.randn(100, 3, device=d, requires_grad=True)
+    v, g = robot(pts)
+    v.sum().backward()
+    assert pts.grad is not None
+    assert torch.allclose(pts.grad, g, atol=1e-4)
+
+
+def test_robot_sdf_batched_config_no_grad():
+    """RobotSDF batched configs: B configs × N points, no-grad."""
+    d = "cuda" if torch.cuda.is_available() else "cpu"
+    robot = _make_kuka_robot(device=d)
+
+    B = 5
+    th = _kuka_base_config(d).unsqueeze(0) + torch.randn(B, 7, device=d) * 0.1
+    robot.set_joint_configuration(th)
+
+    pts = torch.randn(100, 3, device=d) * 0.3
+    v, _ = robot(pts, compute_grad=False)
+    assert v.shape == (B, 100)
+
+
+def test_robot_sdf_batched_config_matches_sequential():
+    """RobotSDF batched configs should match running each config individually."""
+    d = "cuda" if torch.cuda.is_available() else "cpu"
+    robot = _make_kuka_robot(device=d)
+
+    B = 3
+    th_base = _kuka_base_config(d)
+    torch.manual_seed(42)
+    th = th_base.unsqueeze(0) + torch.randn(B, 7, device=d) * 0.1
+
+    # Batched
+    robot.set_joint_configuration(th)
+    pts = torch.randn(50, 3, device=d) * 0.3
+    v_batched, _ = robot(pts, compute_grad=False)
+
+    # Sequential
+    for b in range(B):
+        robot.set_joint_configuration(th[b])
+        v_single, _ = robot(pts, compute_grad=False)
+        max_diff = (v_batched[b] - v_single).abs().max()
+        # Small diffs at voxel boundaries due to floating-point transform differences
+        assert max_diff < 0.02, f"Config {b}: max diff {max_diff:.4f}"
+
+
+def test_robot_sdf_config_change():
+    """RobotSDF: changing config should change SDF values."""
+    d = "cuda" if torch.cuda.is_available() else "cpu"
+    robot = _make_kuka_robot(device=d)
+
+    pts = torch.randn(50, 3, device=d) * 0.3
+
+    robot.set_joint_configuration(_kuka_base_config(d))
+    v1, _ = robot(pts, compute_grad=False)
+
+    # Very different configuration
+    robot.set_joint_configuration(torch.zeros(7, device=d))
+    v2, _ = robot(pts, compute_grad=False)
+
+    # SDF values should differ for most points
+    assert not torch.allclose(v1, v2, atol=1e-3)
+
+
+def test_robot_sdf_link_frame_to_obj_frame():
+    """RobotSDF: link_frame_to_obj_frame populated after with-grad query and is correct."""
+    d = "cuda" if torch.cuda.is_available() else "cpu"
+    robot = _make_kuka_robot(device=d)
+    robot.set_joint_configuration(_kuka_base_config(d))
+
+    composed = robot.sdf
+    assert composed.link_frame_to_obj_frame is None
+
+    pts = torch.randn(10, 3, device=d)
+    robot(pts, compute_grad=True)
+
+    assert composed.link_frame_to_obj_frame is not None
+    S = len(composed.sdfs)
+    assert len(composed.link_frame_to_obj_frame) == S
+
+    # Verify forward ∘ inverse ≈ identity for each link
+    for i, inv_tsf in enumerate(composed.link_frame_to_obj_frame):
+        sl = composed.ith_transform_slice(i)
+        fwd_mat = composed.obj_frame_to_link_frame.get_matrix()[sl]
+        inv_mat = inv_tsf.get_matrix()
+        product = fwd_mat @ inv_mat
+        identity = torch.eye(4, device=d).unsqueeze(0).expand_as(product)
+        assert torch.allclose(product, identity, atol=1e-4)
