@@ -6,6 +6,7 @@ Uses a mix of:
   - CachedSDF from real meshes (L-shape, capsule — asymmetric, non-uniform gradients)
 """
 import os
+import tempfile
 import torch
 import pytorch_kinematics as pk
 import pytorch_volumetric as pv
@@ -13,6 +14,9 @@ from pytorch_volumetric.sdf import OutOfBoundsStrategy
 
 TEST_DIR = os.path.dirname(__file__)
 MESH_DIR = os.path.join(TEST_DIR, "test_meshes")
+
+# Counter for unique cache paths — avoids any possibility of stale cache collisions
+_cache_counter = 0
 
 
 def _make_composed_spheres(n_spheres, offsets, device="cpu"):
@@ -25,14 +29,21 @@ def _make_composed_spheres(n_spheres, offsets, device="cpu"):
     return pv.ComposedSDF(sdfs, tsf)
 
 
+def _unique_cache_path():
+    """Return a unique temp file path for CachedSDF cache. Deleted immediately after creation."""
+    global _cache_counter
+    _cache_counter += 1
+    return os.path.join(tempfile.gettempdir(), f"test_sdf_cache_{os.getpid()}_{_cache_counter}.pkl")
+
+
 def _make_cached_sphere(radius=0.5, resolution=0.02, padding=0.3,
                          out_of_bounds_strategy=OutOfBoundsStrategy.BOUNDING_BOX,
                          method='nearest', device="cpu"):
     """Create a CachedSDF wrapping a SphereSDF (no mesh files needed)."""
     gt = pv.SphereSDF(radius)
     bb = gt.surface_bounding_box(padding=padding).numpy().tolist()
-    cache_path = os.path.join(TEST_DIR, f"test_sphere_cache_{radius}_{resolution}_{padding}.pkl")
-    cached = pv.CachedSDF(f"test_sphere_{radius}", resolution, bb, gt,
+    cache_path = _unique_cache_path()
+    cached = pv.CachedSDF(f"test_sphere_{radius}_{resolution}_{padding}", resolution, bb, gt,
                            out_of_bounds_strategy=out_of_bounds_strategy,
                            device=device, clean_cache=True, cache_path=cache_path,
                            method=method)
@@ -49,8 +60,8 @@ def _make_cached_mesh(mesh_name, resolution=0.005, padding=0.05,
     factory = pv.MeshObjectFactory(mesh_path)
     gt = pv.MeshSDF(factory)
     bb = factory.bounding_box(padding=padding)
-    cache_path = os.path.join(TEST_DIR, f"test_mesh_cache_{mesh_name}_{resolution}.pkl")
-    cached = pv.CachedSDF(mesh_name, resolution, bb, gt,
+    cache_path = _unique_cache_path()
+    cached = pv.CachedSDF(f"{mesh_name}_{resolution}_{padding}", resolution, bb, gt,
                            out_of_bounds_strategy=out_of_bounds_strategy,
                            device=device, clean_cache=True, cache_path=cache_path,
                            method=method)
