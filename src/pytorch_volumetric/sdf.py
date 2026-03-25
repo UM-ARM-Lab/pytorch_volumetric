@@ -599,8 +599,73 @@ class ComposedSDF(ObjectFrameSDF):
             all_idx = torch.arange(N, device=pts.device)
             vv = val[closest, all_idx]
             gg = grad[closest, all_idx]
+        elif batched_view is not None and tsf_batch is not None:
+            # Batched-config with-grad: per-link chunked transform + inline voxel lookup
+            # for both values and gradients, with running min tracking which link is closest.
+            # Mirrors _forward_no_grad's batched path but also gathers gradients.
+            N = flat_shape[0]
+            B = math.prod(tsf_batch)
+            all_mats = obj_frame_to_link_frame.get_matrix().reshape(S, B, 4, 4)
+            pts_3 = points_in_object_frame.T
+            bytes_per_float = 4 if points_in_object_frame.dtype == torch.float32 else 8
+            chunk_size = max(1, (512 * 1024 ** 2) // (N * 3 * bytes_per_float))
+            chunk_size = min(chunk_size, B)
+
+            vv_chunks = []
+            gg_chunks = []
+            for b_start in range(0, B, chunk_size):
+                b_end = min(b_start + chunk_size, B)
+                Bc = b_end - b_start
+                min_val = None
+                min_grad = None
+                for i in range(S):
+                    mat_i = all_mats[i, b_start:b_end]
+                    R_i = mat_i[:, :3, :3]
+                    t_i = mat_i[:, :3, 3:]
+                    transformed = (R_i @ pts_3 + t_i).permute(0, 2, 1).reshape(-1, 3)
+                    # Inline CachedSDF lookup for value + gradient
+                    v_i = sdfs[i].voxels
+                    valid = ((transformed >= v_i._min) & (transformed <= v_i._max)).all(dim=-1)
+                    idx = ((transformed - v_i._min) * v_i._inv_resolution).round().long()
+                    flat_idx = (idx * v_i._ravel_coefs).sum(dim=-1).clamp(min=0, max=v_i._d.shape[0] - 1)
+                    val_i = v_i._d[flat_idx]
+                    grad_i = sdfs[i].voxels_grad[flat_idx]
+                    if not valid.all():
+                        oob = ~valid
+                        trunc = sdfs[i].truncation_distance
+                        if trunc is not None:
+                            val_i[oob] = trunc
+                            grad_i[oob] = 0
+                        elif sdfs[i].out_of_bounds_strategy == OutOfBoundsStrategy.BOUNDING_BOX:
+                            bb = sdfs[i].bb
+                            if bb.dtype != transformed.dtype:
+                                bb = bb.to(dtype=transformed.dtype)
+                            pts_oob = transformed[oob]
+                            dmin = (bb[:, 0] - pts_oob).clamp(min=0)
+                            dmax = (pts_oob - bb[:, 1]).clamp(min=0)
+                            val_i[oob] = (dmin + dmax).norm(dim=-1)
+                            dtotal = dmax - dmin
+                            grad_i[oob] = dtotal / (dmin + dmax).norm(dim=-1).unsqueeze(-1).clamp(min=1e-8)
+                        elif sdfs[i].out_of_bounds_strategy == OutOfBoundsStrategy.LOOKUP_GT_SDF:
+                            val_i[oob], grad_i[oob] = sdfs[i].gt_sdf(transformed[oob])
+                    # Rotate gradient to object frame: (Bc*N, 3) @ (Bc, 3, 3)
+                    rot = grad_rotation_mats[i]
+                    grad_i = grad_i.reshape(Bc, N, 3)
+                    grad_i = grad_i.bmm(rot[b_start:b_end]).reshape(-1, 3)
+                    # Running min: update where this link is closer
+                    if min_val is None:
+                        min_val = val_i
+                        min_grad = grad_i
+                    else:
+                        closer = val_i < min_val
+                        min_val[closer] = val_i[closer]
+                        min_grad[closer] = grad_i[closer]
+                vv_chunks.append(min_val)
+                gg_chunks.append(min_grad)
+            vv = torch.cat(vv_chunks)
+            gg = torch.cat(gg_chunks)
         else:
-            # Sequential fallback: per-link autograd (for non-CachedSDF or batched configs)
+            # Sequential fallback: per-link autograd (for non-CachedSDF)
             pts = obj_frame_to_link_frame.transform_points(points_in_object_frame)
             if tsf_batch is not None:
                 pts = pts.reshape(S, *tsf_batch, *flat_shape)
