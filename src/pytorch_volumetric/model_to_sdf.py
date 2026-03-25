@@ -126,8 +126,26 @@ class RobotSDF(sdf.ObjectFrameSDF):
         """
         return self.sdf(points_in_object_frame, compute_grad=compute_grad)
 
+    def compile(self):
+        """Compile each link's CachedSDF no-grad lookup with torch.compile for faster queries.
+        Call once after construction; subsequent no-grad queries will use the compiled kernels.
+        First query after compile will be slower due to compilation overhead."""
+        import torch
+        for link_sdf in self.sdf.sdfs:
+            if isinstance(link_sdf, sdf.CachedSDF):
+                link_sdf._forward_no_grad = torch.compile(link_sdf._forward_no_grad)
+
 
 def cache_link_sdf_factory(resolution=0.01, padding=0.1, **kwargs):
+    """Factory for creating CachedSDF instances for each robot link.
+
+    :param resolution: voxel cell size
+    :param padding: padding around the surface bounding box for the voxel grid.
+        When truncation_distance is set, consider setting padding=truncation_distance
+        for much smaller grids that only cover the near-surface region.
+    :param kwargs: additional arguments passed to CachedSDF (e.g. truncation_distance,
+        device, out_of_bounds_strategy, method)
+    """
     def create_sdf(obj_factory: sdf.ObjectFactory):
         gt_sdf = sdf.MeshSDF(obj_factory)
         return sdf.CachedSDF(obj_factory.name, resolution, obj_factory.bounding_box(padding=padding), gt_sdf, **kwargs)

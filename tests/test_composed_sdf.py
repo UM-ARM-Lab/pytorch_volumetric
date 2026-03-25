@@ -883,3 +883,107 @@ def test_robot_sdf_link_frame_to_obj_frame():
         product = fwd_mat @ inv_mat
         identity = torch.eye(4, device=d).unsqueeze(0).expand_as(product)
         assert torch.allclose(product, identity, atol=1e-4)
+
+
+# ── TSDF (truncation_distance) tests ────────────────────────────────────────
+
+def test_cached_sdf_tsdf_oob_returns_truncation():
+    """CachedSDF with truncation_distance: OOB points return the truncation value."""
+    d = "cuda" if torch.cuda.is_available() else "cpu"
+    trunc = 0.1
+    cached = _make_cached_sphere(padding=0.1, device=d,
+                                  out_of_bounds_strategy=OutOfBoundsStrategy.BOUNDING_BOX)
+    cached_tsdf = _make_cached_sphere(padding=0.1, device=d)
+    # Manually set truncation_distance (normally set via constructor)
+    cached_tsdf.truncation_distance = trunc
+
+    # Far OOB points
+    pts_far = torch.tensor([[5.0, 0.0, 0.0], [0.0, 5.0, 0.0]], device=d)
+    v_tsdf, _ = cached_tsdf(pts_far, compute_grad=False)
+    assert torch.allclose(v_tsdf, torch.tensor(trunc, device=d))
+
+    # In-bound points should be identical (truncation only affects OOB)
+    pts_near = torch.randn(100, 3, device=d) * 0.1
+    v_normal, _ = cached(pts_near, compute_grad=False)
+    v_tsdf_near, _ = cached_tsdf(pts_near, compute_grad=False)
+    assert torch.allclose(v_normal, v_tsdf_near, atol=1e-6)
+
+
+def test_cached_sdf_tsdf_with_grad():
+    """CachedSDF TSDF: with-grad OOB returns truncation value and zero gradient."""
+    d = "cuda" if torch.cuda.is_available() else "cpu"
+    trunc = 0.2
+    cached = _make_cached_sphere(padding=0.1, device=d)
+    cached.truncation_distance = trunc
+
+    pts_far = torch.tensor([[5.0, 0.0, 0.0]], device=d)
+    v, g = cached(pts_far, compute_grad=True)
+    assert torch.allclose(v, torch.tensor(trunc, device=d))
+    assert torch.allclose(g, torch.zeros(1, 3, device=d))
+
+
+def test_composed_cached_tsdf_batched_config():
+    """ComposedSDF with TSDF CachedSDFs: batched-config path handles truncation."""
+    d = "cuda" if torch.cuda.is_available() else "cpu"
+    trunc = 0.1
+    sdfs = [_make_cached_sphere(padding=0.1, device=d),
+            _make_cached_sphere(padding=0.1, device=d)]
+    for s in sdfs:
+        s.truncation_distance = trunc
+
+    B, S = 3, 2
+    matrices = torch.eye(4, device=d).unsqueeze(0).repeat(B * S, 1, 1)
+    for b in range(B):
+        matrices[0 * B + b, 0, 3] = -(b + 1.0)
+        matrices[1 * B + b, 0, 3] = (b + 1.0)
+
+    composed = pv.ComposedSDF(sdfs, None)
+    composed.set_transforms(pk.Transform3d(matrix=matrices, device=d), batch_dim=(B,))
+
+    pts = torch.randn(50, 3, device=d) * 0.3
+    v, _ = composed(pts, compute_grad=False)
+    assert v.shape == (B, 50)
+    # All values should be <= truncation_distance (TSDF clamps OOB at truncation)
+    assert (v <= trunc + 1e-6).all()
+
+
+def test_robot_sdf_tsdf():
+    """RobotSDF with TSDF: tight padding + truncation_distance for fast queries."""
+    d = "cuda" if torch.cuda.is_available() else "cpu"
+    trunc = 0.1
+    robot = _make_kuka_robot(device=d, resolution=0.02, padding=trunc)
+    # Set truncation on all link SDFs
+    for link_sdf in robot.sdf.sdfs:
+        link_sdf.truncation_distance = trunc
+
+    robot.set_joint_configuration(_kuka_base_config(d))
+    pts = torch.randn(200, 3, device=d) * 0.5
+    v, _ = robot(pts, compute_grad=False)
+    assert v.shape == (200,)
+    assert (v <= trunc + 1e-6).all()
+
+    # Batched config
+    th = _kuka_base_config(d).unsqueeze(0) + torch.randn(3, 7, device=d) * 0.1
+    robot.set_joint_configuration(th)
+    v_batched, _ = robot(pts, compute_grad=False)
+    assert v_batched.shape == (3, 200)
+    assert (v_batched <= trunc + 1e-6).all()
+
+
+# ── torch.compile tests ─────────────────────────────────────────────────────
+
+def test_robot_sdf_compile():
+    """RobotSDF.compile(): compiled no-grad queries produce same results as uncompiled."""
+    d = "cuda" if torch.cuda.is_available() else "cpu"
+    robot = _make_kuka_robot(device=d)
+    robot.set_joint_configuration(_kuka_base_config(d))
+
+    pts = torch.randn(100, 3, device=d) * 0.3
+    v_before, _ = robot(pts, compute_grad=False)
+
+    robot.compile()
+    # Warmup compile
+    robot(pts, compute_grad=False)
+
+    v_after, _ = robot(pts, compute_grad=False)
+    assert torch.allclose(v_before, v_after, atol=1e-6)

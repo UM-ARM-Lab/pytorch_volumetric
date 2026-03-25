@@ -516,21 +516,25 @@ class ComposedSDF(ObjectFrameSDF):
         # batched voxel grid lookup — returns (S, N) values and (S, N) validity mask
         val, valid = self._batched_view(pts)
 
-        # handle out-of-bounds points per the CachedSDF strategy
+        # handle out-of-bounds points
         oob = ~valid
         if oob.any():
-            oob_strategy = self.sdfs[0].out_of_bounds_strategy
-            if oob_strategy == OutOfBoundsStrategy.BOUNDING_BOX:
-                bb = torch.stack([s.bb for s in self.sdfs]).to(dtype=pts.dtype)  # (S, 3, 2)
-                dmin = (bb[:, :, 0][:, None, :] - pts).clamp(min=0)
-                dmax = (pts - bb[:, :, 1][:, None, :]).clamp(min=0)
-                oob_dist = (dmin + dmax).norm(dim=-1)  # (S, N)
-                val[oob] = oob_dist[oob]
-            elif oob_strategy == OutOfBoundsStrategy.LOOKUP_GT_SDF:
-                for i, sdf_i in enumerate(self.sdfs):
-                    oob_i = oob[i]
-                    if oob_i.any():
-                        val[i, oob_i], _ = sdf_i.gt_sdf(pts[i, oob_i], compute_grad=False)
+            trunc = self.sdfs[0].truncation_distance
+            if trunc is not None:
+                val[oob] = trunc
+            else:
+                oob_strategy = self.sdfs[0].out_of_bounds_strategy
+                if oob_strategy == OutOfBoundsStrategy.BOUNDING_BOX:
+                    bb = torch.stack([s.bb for s in self.sdfs]).to(dtype=pts.dtype)  # (S, 3, 2)
+                    dmin = (bb[:, :, 0][:, None, :] - pts).clamp(min=0)
+                    dmax = (pts - bb[:, :, 1][:, None, :]).clamp(min=0)
+                    oob_dist = (dmin + dmax).norm(dim=-1)  # (S, N)
+                    val[oob] = oob_dist[oob]
+                elif oob_strategy == OutOfBoundsStrategy.LOOKUP_GT_SDF:
+                    for i, sdf_i in enumerate(self.sdfs):
+                        oob_i = oob[i]
+                        if oob_i.any():
+                            val[i, oob_i], _ = sdf_i.gt_sdf(pts[i, oob_i], compute_grad=False)
 
         return val.min(dim=0).values
 
@@ -593,7 +597,7 @@ class CachedSDF(ObjectFrameSDF):
                  out_of_bounds_strategy=OutOfBoundsStrategy.BOUNDING_BOX,
                  device="cpu", clean_cache=False,
                  debug_check_sdf=False, cache_path="sdf_cache.pkl",
-                 method='nearest'):
+                 method='nearest', truncation_distance=None):
         """
 
         :param object_name: str readable name of the object; combined with the resolution and range for cache
@@ -603,15 +607,21 @@ class CachedSDF(ObjectFrameSDF):
         :param out_of_bounds_strategy: what to do when a query is outside the cached range.
         LOOKUP_GT_SDF: use the ground truth SDF for the value and gradient (relatively expensive)
         BOUNDING_BOX: use the distance to the bounding box (under-approximates the SDF value)
+        Ignored when truncation_distance is set (OOB points return truncation_distance).
         :param device: pytorch compatible device
         :param clean_cache: whether to ignore the existing cache and force recomputation
         :param debug_check_sdf: check that the generated SDF matches the ground truth SDF
         :param cache_path: path where to store the SDF cache for efficient loading
         :param method: interpolation method for voxel lookups, 'nearest' or 'linear'.
         'linear' gives higher accuracy at a small performance cost.
+        :param truncation_distance: if set, OOB points return this value instead of using
+        out_of_bounds_strategy. Use with padding=truncation_distance for much smaller voxel grids
+        that only cover the near-surface region (TSDF). For planning/collision checking, values
+        beyond the truncation distance are irrelevant.
         """
         self.method = method
         self.device = device
+        self.truncation_distance = truncation_distance
         # cache for signed distance field to object
         self.voxels = None
         # voxel grid can't handle vector values yet
@@ -688,7 +698,8 @@ class CachedSDF(ObjectFrameSDF):
     def __call__(self, points_in_object_frame, compute_grad=True):
         if compute_grad:
             return self.apply(points_in_object_frame, self.voxels, self.voxels_grad, self.bb,
-                              self.out_of_bounds_strategy, self.device, self.gt_sdf, self.method)
+                              self.out_of_bounds_strategy, self.device, self.gt_sdf, self.method,
+                              self.truncation_distance)
         return self._forward_no_grad(points_in_object_frame)
 
     def _forward_no_grad(self, points_in_object_frame):
@@ -708,7 +719,9 @@ class CachedSDF(ObjectFrameSDF):
 
         if not valid.all():
             oob = ~valid
-            if self.out_of_bounds_strategy == OutOfBoundsStrategy.LOOKUP_GT_SDF:
+            if self.truncation_distance is not None:
+                val[oob] = self.truncation_distance
+            elif self.out_of_bounds_strategy == OutOfBoundsStrategy.LOOKUP_GT_SDF:
                 val[oob], _ = self.gt_sdf(pts[oob], compute_grad=False)
             elif self.out_of_bounds_strategy == OutOfBoundsStrategy.BOUNDING_BOX:
                 bb = self.bb
@@ -723,7 +736,7 @@ class CachedSDF(ObjectFrameSDF):
 
     @staticmethod
     def forward(ctx, points_in_object_frame, voxels, voxels_grad, bb, out_of_bounds_strategy, device, gt_sdf,
-                method='nearest'):
+                method='nearest', truncation_distance=None):
         if method == 'linear':
             # use TorchMultidimView.__getitem__ for trilinear interpolation of values
             val = voxels[points_in_object_frame]
@@ -748,7 +761,10 @@ class CachedSDF(ObjectFrameSDF):
             grad[inbound_keys] = voxels_grad[keys_ravelled[inbound_keys]]
 
         points_oob = points_in_object_frame[out_of_bound_keys]
-        if out_of_bounds_strategy == OutOfBoundsStrategy.LOOKUP_GT_SDF:
+        if truncation_distance is not None:
+            val[out_of_bound_keys] = truncation_distance
+            grad[out_of_bound_keys] = 0
+        elif out_of_bounds_strategy == OutOfBoundsStrategy.LOOKUP_GT_SDF:
             val[out_of_bound_keys], grad[out_of_bound_keys] = gt_sdf(points_oob)
         elif out_of_bounds_strategy == OutOfBoundsStrategy.BOUNDING_BOX:
             if bb.dtype != dtype:
@@ -787,7 +803,7 @@ class CachedSDF(ObjectFrameSDF):
         #     within_bounds = self.voxels.get_valid_values(points_in_object_frame)
         #     assert torch.all(close_enough[within_bounds])
         ctx.save_for_backward(grad)
-        ctx.num_inputs = 8
+        ctx.num_inputs = 9
         return val, grad
 
     def outside_surface(self, points_in_object_frame, surface_level=0):
