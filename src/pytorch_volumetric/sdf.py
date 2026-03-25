@@ -375,12 +375,14 @@ class ComposedSDF(ObjectFrameSDF):
         self.sdfs = sdfs
         self.obj_frame_to_link_frame: typing.Optional[pk.Transform3d] = None
         self.tsf_batch = None
-        # BatchedViewLookup only depends on the voxel grids, which don't change —
+        # BatchedViewLookup + gradient data only depend on voxel grids (don't change) —
         # create once rather than on every set_transforms call.
         if all(isinstance(s, CachedSDF) and s.method == 'nearest' for s in sdfs):
             self._batched_view = BatchedViewLookup([s.voxels for s in sdfs])
+            self._batched_grad_data = torch.cat([s.voxels_grad for s in sdfs])
         else:
             self._batched_view = None
+            self._batched_grad_data = None
         self.set_transforms(obj_frame_to_each_frame)
 
     def surface_bounding_box(self, **kwargs):
@@ -444,7 +446,7 @@ class ComposedSDF(ObjectFrameSDF):
         if compute_grad:
             self._ensure_inverse_transforms()
             return self.apply(points_in_object_frame, self.sdfs, self.obj_frame_to_link_frame, self.tsf_batch,
-                              self._grad_rotation_mats)
+                              self._grad_rotation_mats, self._batched_view, self._batched_grad_data)
         return self._forward_no_grad(points_in_object_frame)
 
     def _forward_no_grad(self, points_in_object_frame):
@@ -539,49 +541,102 @@ class ComposedSDF(ObjectFrameSDF):
         return val.min(dim=0).values
 
     @staticmethod
-    def forward(ctx, points_in_object_frame, sdfs, obj_frame_to_link_frame, tsf_batch, grad_rotation_mats):
+    def forward(ctx, points_in_object_frame, sdfs, obj_frame_to_link_frame, tsf_batch, grad_rotation_mats,
+                batched_view, batched_grad_data):
         pts_shape = points_in_object_frame.shape
         points_in_object_frame = points_in_object_frame.view(-1, 3)
         flat_shape = points_in_object_frame.shape
         S = len(sdfs)
 
-        pts = obj_frame_to_link_frame.transform_points(points_in_object_frame)
-        if tsf_batch is not None:
-            pts = pts.reshape(S, *tsf_batch, *flat_shape)
+        if batched_view is not None and tsf_batch is None:
+            # Vectorized path: single-config with all CachedSDF nearest-neighbor links.
+            # Bypasses S separate autograd.Function calls by doing the voxel value + gradient
+            # lookup directly through BatchedViewLookup's precomputed grid parameters.
+            # This reduces GPU kernel launches from ~16*S to ~10 total.
+            pts = obj_frame_to_link_frame.transform_points(points_in_object_frame)
+            bv = batched_view
 
-        sdfv = []
-        sdfg = []
-        for i, sdf in enumerate(sdfs):
-            v, g = sdf(pts[i])
-            # Transform gradient back to object frame using precomputed rotation matrices
-            rot = grad_rotation_mats[i]
-            if g.dim() == 2:
-                g = torch.mm(g, rot.squeeze(0))
-            else:
-                if len(g) != len(rot):
-                    if len(rot) == 1:
-                        rot = rot.expand(len(g), -1, -1)
-                    elif len(g) == 1:
-                        g = g.expand(len(rot), -1, -1)
-                g = g.bmm(rot)
-            sdfv.append(v)
-            sdfg.append(g)
+            valid = (pts >= bv.mins[:, None, :]) & (pts <= bv.maxs[:, None, :])
+            valid = valid.all(dim=-1)
+            idx = ((pts - bv.mins[:, None, :]) * bv.inv_res[:, None, :]).round().long()
+            flat_idx = (idx * bv.ravel_coefs[:, None, :]).sum(dim=-1).clamp(min=0)
+            global_idx = (flat_idx + bv.data_offsets[:, None]).clamp(max=bv.flat_data.shape[0] - 1)
 
-        sdfv = torch.cat(sdfv)
-        sdfg = torch.cat(sdfg)
-        v = sdfv.reshape(S, -1)
-        g = sdfg.reshape(S, -1, 3)
-        closest = torch.argmin(v, 0)
-        all_idx = torch.arange(0, v.shape[1])
-        vv = v[closest, all_idx]
-        gg = g[closest, all_idx]
+            val = bv.flat_data[global_idx]
+            val[~valid] = 0
+            grad = batched_grad_data[global_idx]
+            grad[~valid] = 0
+
+            oob = ~valid
+            if oob.any():
+                trunc = sdfs[0].truncation_distance
+                if trunc is not None:
+                    val[oob] = trunc
+                else:
+                    oob_strategy = sdfs[0].out_of_bounds_strategy
+                    if oob_strategy == OutOfBoundsStrategy.BOUNDING_BOX:
+                        bb = torch.stack([s.bb for s in sdfs]).to(dtype=pts.dtype)
+                        dmin = (bb[:, :, 0][:, None, :] - pts).clamp(min=0)
+                        dmax = (pts - bb[:, :, 1][:, None, :]).clamp(min=0)
+                        dtotal = dmax - dmin
+                        oob_dist = (dmin + dmax).norm(dim=-1)
+                        val[oob] = oob_dist[oob]
+                        oob_grad = dtotal / oob_dist.unsqueeze(-1).clamp(min=1e-8)
+                        grad[oob] = oob_grad[oob]
+                    elif oob_strategy == OutOfBoundsStrategy.LOOKUP_GT_SDF:
+                        for i, sdf_i in enumerate(sdfs):
+                            oob_i = oob[i]
+                            if oob_i.any():
+                                val[i, oob_i], grad[i, oob_i] = sdf_i.gt_sdf(pts[i, oob_i])
+
+            # Rotate gradients from link frame to object frame
+            for i in range(S):
+                rot = grad_rotation_mats[i]
+                grad[i] = torch.mm(grad[i], rot.squeeze(0))
+
+            N = val.shape[1]
+            closest = torch.argmin(val, 0)
+            all_idx = torch.arange(N, device=pts.device)
+            vv = val[closest, all_idx]
+            gg = grad[closest, all_idx]
+        else:
+            # Sequential fallback: per-link autograd (for non-CachedSDF or batched configs)
+            pts = obj_frame_to_link_frame.transform_points(points_in_object_frame)
+            if tsf_batch is not None:
+                pts = pts.reshape(S, *tsf_batch, *flat_shape)
+
+            sdfv = []
+            sdfg = []
+            for i, sdf in enumerate(sdfs):
+                v, g = sdf(pts[i])
+                rot = grad_rotation_mats[i]
+                if g.dim() == 2:
+                    g = torch.mm(g, rot.squeeze(0))
+                else:
+                    if len(g) != len(rot):
+                        if len(rot) == 1:
+                            rot = rot.expand(len(g), -1, -1)
+                        elif len(g) == 1:
+                            g = g.expand(len(rot), -1, -1)
+                    g = g.bmm(rot)
+                sdfv.append(v)
+                sdfg.append(g)
+
+            sdfv = torch.cat(sdfv)
+            sdfg = torch.cat(sdfg)
+            v = sdfv.reshape(S, -1)
+            g = sdfg.reshape(S, -1, 3)
+            closest = torch.argmin(v, 0)
+            all_idx = torch.arange(0, v.shape[1])
+            vv = v[closest, all_idx]
+            gg = g[closest, all_idx]
 
         if tsf_batch is not None:
             vv = vv.reshape(*tsf_batch, *pts_shape[:-1])
             gg = gg.reshape(*tsf_batch, *pts_shape[:-1], 3)
 
         ctx.save_for_backward(gg)
-        ctx.num_inputs = 5
+        ctx.num_inputs = 7
         return vv, gg
 
 
