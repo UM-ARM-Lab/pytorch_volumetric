@@ -442,6 +442,60 @@ class ComposedSDF(ObjectFrameSDF):
             total_to_slice = math.prod(list(self.tsf_batch))
             return slice(i * total_to_slice, (i + 1) * total_to_slice)
 
+    @staticmethod
+    def _handle_oob_batched(sdfs, pts, val, oob, grad=None):
+        """Handle OOB points for batched (S, N) tensors. Modifies val (and grad if given) in-place."""
+        trunc = sdfs[0].truncation_distance
+        if trunc is not None:
+            val[oob] = trunc
+            if grad is not None:
+                grad[oob] = 0
+            return
+        oob_strategy = sdfs[0].out_of_bounds_strategy
+        if oob_strategy == OutOfBoundsStrategy.BOUNDING_BOX:
+            bb = torch.stack([s.bb for s in sdfs]).to(dtype=pts.dtype)
+            dmin = (bb[:, :, 0][:, None, :] - pts).clamp(min=0)
+            dmax = (pts - bb[:, :, 1][:, None, :]).clamp(min=0)
+            oob_dist = (dmin + dmax).norm(dim=-1)
+            val[oob] = oob_dist[oob]
+            if grad is not None:
+                dtotal = dmax - dmin
+                grad[oob] = (dtotal / oob_dist.unsqueeze(-1).clamp(min=1e-8))[oob]
+        elif oob_strategy == OutOfBoundsStrategy.LOOKUP_GT_SDF:
+            for i, sdf_i in enumerate(sdfs):
+                oob_i = oob[i]
+                if oob_i.any():
+                    if grad is not None:
+                        val[i, oob_i], grad[i, oob_i] = sdf_i.gt_sdf(pts[i, oob_i])
+                    else:
+                        val[i, oob_i], _ = sdf_i.gt_sdf(pts[i, oob_i], compute_grad=False)
+
+    @staticmethod
+    def _handle_oob_per_link(sdf_i, pts, val, oob, grad=None):
+        """Handle OOB points for a single link's (M,) tensors. Modifies val (and grad) in-place."""
+        trunc = sdf_i.truncation_distance
+        if trunc is not None:
+            val[oob] = trunc
+            if grad is not None:
+                grad[oob] = 0
+            return
+        if sdf_i.out_of_bounds_strategy == OutOfBoundsStrategy.BOUNDING_BOX:
+            bb = sdf_i.bb
+            if bb.dtype != pts.dtype:
+                bb = bb.to(dtype=pts.dtype)
+            pts_oob = pts[oob]
+            dmin = (bb[:, 0] - pts_oob).clamp(min=0)
+            dmax = (pts_oob - bb[:, 1]).clamp(min=0)
+            val[oob] = (dmin + dmax).norm(dim=-1)
+            if grad is not None:
+                dtotal = dmax - dmin
+                grad[oob] = dtotal / (dmin + dmax).norm(dim=-1).unsqueeze(-1).clamp(min=1e-8)
+        elif sdf_i.out_of_bounds_strategy == OutOfBoundsStrategy.LOOKUP_GT_SDF:
+            if grad is not None:
+                val[oob], grad[oob] = sdf_i.gt_sdf(pts[oob])
+            else:
+                val[oob], _ = sdf_i.gt_sdf(pts[oob], compute_grad=False)
+
     def __call__(self, points_in_object_frame, compute_grad=True):
         if compute_grad:
             self._ensure_inverse_transforms()
@@ -501,21 +555,7 @@ class ComposedSDF(ObjectFrameSDF):
             val, valid = self._batched_view(pts)
             oob = ~valid
             if oob.any():
-                trunc = self.sdfs[0].truncation_distance
-                if trunc is not None:
-                    val[oob] = trunc
-                else:
-                    oob_strategy = self.sdfs[0].out_of_bounds_strategy
-                    if oob_strategy == OutOfBoundsStrategy.BOUNDING_BOX:
-                        bb = torch.stack([s.bb for s in self.sdfs]).to(dtype=pts.dtype)
-                        dmin = (bb[:, :, 0][:, None, :] - pts).clamp(min=0)
-                        dmax = (pts - bb[:, :, 1][:, None, :]).clamp(min=0)
-                        val[oob] = (dmin + dmax).norm(dim=-1)[oob]
-                    elif oob_strategy == OutOfBoundsStrategy.LOOKUP_GT_SDF:
-                        for i, sdf_i in enumerate(self.sdfs):
-                            oob_i = oob[i]
-                            if oob_i.any():
-                                val[i, oob_i], _ = sdf_i.gt_sdf(pts[i, oob_i], compute_grad=False)
+                self._handle_oob_batched(self.sdfs, pts, val, oob)
             vv = val.min(dim=0).values
 
         if self.tsf_batch is not None:
@@ -587,25 +627,7 @@ class ComposedSDF(ObjectFrameSDF):
 
             oob = ~valid
             if oob.any():
-                trunc = sdfs[0].truncation_distance
-                if trunc is not None:
-                    val[oob] = trunc
-                else:
-                    oob_strategy = sdfs[0].out_of_bounds_strategy
-                    if oob_strategy == OutOfBoundsStrategy.BOUNDING_BOX:
-                        bb = torch.stack([s.bb for s in sdfs]).to(dtype=pts.dtype)
-                        dmin = (bb[:, :, 0][:, None, :] - pts).clamp(min=0)
-                        dmax = (pts - bb[:, :, 1][:, None, :]).clamp(min=0)
-                        dtotal = dmax - dmin
-                        oob_dist = (dmin + dmax).norm(dim=-1)
-                        val[oob] = oob_dist[oob]
-                        oob_grad = dtotal / oob_dist.unsqueeze(-1).clamp(min=1e-8)
-                        grad[oob] = oob_grad[oob]
-                    elif oob_strategy == OutOfBoundsStrategy.LOOKUP_GT_SDF:
-                        for i, sdf_i in enumerate(sdfs):
-                            oob_i = oob[i]
-                            if oob_i.any():
-                                val[i, oob_i], grad[i, oob_i] = sdf_i.gt_sdf(pts[i, oob_i])
+                ComposedSDF._handle_oob_batched(sdfs, pts, val, oob, grad)
 
             for i in range(S):
                 grad[i] = torch.mm(grad[i], grad_rotation_mats[i].squeeze(0))
@@ -641,23 +663,7 @@ class ComposedSDF(ObjectFrameSDF):
                     val_i = v_i._d[flat_idx]
                     grad_i = sdfs[i].voxels_grad[flat_idx]
                     if not valid.all():
-                        oob = ~valid
-                        trunc = sdfs[i].truncation_distance
-                        if trunc is not None:
-                            val_i[oob] = trunc
-                            grad_i[oob] = 0
-                        elif sdfs[i].out_of_bounds_strategy == OutOfBoundsStrategy.BOUNDING_BOX:
-                            bb = sdfs[i].bb
-                            if bb.dtype != transformed.dtype:
-                                bb = bb.to(dtype=transformed.dtype)
-                            pts_oob = transformed[oob]
-                            dmin = (bb[:, 0] - pts_oob).clamp(min=0)
-                            dmax = (pts_oob - bb[:, 1]).clamp(min=0)
-                            val_i[oob] = (dmin + dmax).norm(dim=-1)
-                            dtotal = dmax - dmin
-                            grad_i[oob] = dtotal / (dmin + dmax).norm(dim=-1).unsqueeze(-1).clamp(min=1e-8)
-                        elif sdfs[i].out_of_bounds_strategy == OutOfBoundsStrategy.LOOKUP_GT_SDF:
-                            val_i[oob], grad_i[oob] = sdfs[i].gt_sdf(transformed[oob])
+                        ComposedSDF._handle_oob_per_link(sdfs[i], transformed, val_i, ~valid, grad_i)
                     grad_i = grad_i.reshape(Bc, N, 3)
                     grad_i = grad_i.bmm(grad_rotation_mats[i][b_start:b_end]).reshape(-1, 3)
                     if min_val is None:
