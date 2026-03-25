@@ -539,16 +539,76 @@ class ComposedSDF(ObjectFrameSDF):
                               self._grad_rotation_mats, self._batched_view, self._batched_grad_data)
         return self._forward_no_grad(points_in_object_frame)
 
+    @staticmethod
+    def _core_lookup(sdfs, obj_frame_to_link_frame, tsf_batch, batched_view,
+                     batched_grad_data, grad_rotation_mats, points, compute_grad):
+        """Core SDF lookup across all links. Returns (vv, gg_or_None)."""
+        S = len(sdfs)
+        N = points.shape[0]
+        if tsf_batch is None:
+            # Single-config: vectorized across all S links.
+            pts = obj_frame_to_link_frame.transform_points(points)
+            val, grad = ComposedSDF._batched_lookup(
+                batched_view, batched_grad_data, sdfs, pts, compute_grad=compute_grad)
+            if compute_grad:
+                for i in range(S):
+                    grad[i] = torch.mm(grad[i], grad_rotation_mats[i].squeeze(0))
+            closest = torch.argmin(val, 0)
+            all_idx = torch.arange(N, device=pts.device)
+            vv = val[closest, all_idx]
+            gg = grad[closest, all_idx] if compute_grad else None
+        else:
+            # Batched-config: per-link transform + lookup + running min, chunked over B.
+            B = math.prod(tsf_batch)
+            all_mats = obj_frame_to_link_frame.get_matrix().reshape(S, B, 4, 4)
+            pts_3 = points.T
+            bytes_per_float = 4 if points.dtype == torch.float32 else 8
+            chunk_size = max(1, (512 * 1024 ** 2) // (N * 3 * bytes_per_float))
+            chunk_size = min(chunk_size, B)
+            vv_chunks = []
+            gg_chunks = [] if compute_grad else None
+            for b_start in range(0, B, chunk_size):
+                b_end = min(b_start + chunk_size, B)
+                Bc = b_end - b_start
+                min_val = None
+                min_grad = None
+                for i in range(S):
+                    R_i = all_mats[i, b_start:b_end, :3, :3]
+                    t_i = all_mats[i, b_start:b_end, :3, 3:]
+                    transformed = (R_i @ pts_3 + t_i).permute(0, 2, 1).reshape(-1, 3)
+                    val_i, grad_i = ComposedSDF._inline_link_lookup(
+                        sdfs[i], transformed, compute_grad=compute_grad)
+                    if compute_grad:
+                        grad_i = grad_i.reshape(Bc, N, 3)
+                        grad_i = grad_i.bmm(grad_rotation_mats[i][b_start:b_end]).reshape(-1, 3)
+                    if min_val is None:
+                        min_val = val_i
+                        if compute_grad:
+                            min_grad = grad_i
+                    else:
+                        if compute_grad:
+                            closer = val_i < min_val
+                            min_val[closer] = val_i[closer]
+                            min_grad[closer] = grad_i[closer]
+                        else:
+                            torch.minimum(min_val, val_i, out=min_val)
+                vv_chunks.append(min_val)
+                if compute_grad:
+                    gg_chunks.append(min_grad)
+            vv = torch.cat(vv_chunks)
+            gg = torch.cat(gg_chunks) if compute_grad else None
+        return vv, gg
+
     def _forward_no_grad(self, points_in_object_frame):
         pts_shape = points_in_object_frame.shape
-        points_in_object_frame = points_in_object_frame.view(-1, 3)
+        points = points_in_object_frame.view(-1, 3)
         S = len(self.sdfs)
 
         # Fallback for non-CachedSDF links (e.g. SphereSDF, MeshSDF, linear interp)
         if self._batched_view is None:
-            pts = self.obj_frame_to_link_frame.transform_points(points_in_object_frame)
+            pts = self.obj_frame_to_link_frame.transform_points(points)
             if self.tsf_batch is not None:
-                pts = pts.reshape(S, *self.tsf_batch, *points_in_object_frame.shape)
+                pts = pts.reshape(S, *self.tsf_batch, *points.shape)
             sdfv = []
             for i, sdf in enumerate(self.sdfs):
                 v, _ = sdf(pts[i], compute_grad=False)
@@ -558,38 +618,8 @@ class ComposedSDF(ObjectFrameSDF):
                 vv = vv.reshape(*self.tsf_batch, *pts_shape[:-1])
             return vv, None
 
-        # Optimized path: all links are CachedSDF with nearest-neighbor.
-        N = points_in_object_frame.shape[0]
-        if self.tsf_batch is not None:
-            # Batched-config: per-link transform + lookup + running min, chunked over B.
-            B = math.prod(self.tsf_batch)
-            all_mats = self.obj_frame_to_link_frame.get_matrix().reshape(S, B, 4, 4)
-            pts_3 = points_in_object_frame.T
-            bytes_per_float = 4 if points_in_object_frame.dtype == torch.float32 else 8
-            chunk_size = max(1, (512 * 1024 ** 2) // (N * 3 * bytes_per_float))
-            chunk_size = min(chunk_size, B)
-            vv_chunks = []
-            for b_start in range(0, B, chunk_size):
-                b_end = min(b_start + chunk_size, B)
-                Bc = b_end - b_start
-                min_val = None
-                for i in range(S):
-                    R_i = all_mats[i, b_start:b_end, :3, :3]
-                    t_i = all_mats[i, b_start:b_end, :3, 3:]
-                    transformed = (R_i @ pts_3 + t_i).permute(0, 2, 1).reshape(-1, 3)
-                    val_i, _ = self._inline_link_lookup(self.sdfs[i], transformed)
-                    if min_val is None:
-                        min_val = val_i
-                    else:
-                        torch.minimum(min_val, val_i, out=min_val)
-                vv_chunks.append(min_val)
-            vv = torch.cat(vv_chunks)
-        else:
-            # Single-config: vectorized across all S links.
-            pts = self.obj_frame_to_link_frame.transform_points(points_in_object_frame)
-            val, _ = self._batched_lookup(self._batched_view, None, self.sdfs, pts)
-            vv = val.min(dim=0).values
-
+        vv, _ = self._core_lookup(self.sdfs, self.obj_frame_to_link_frame, self.tsf_batch,
+                                   self._batched_view, None, None, points, compute_grad=False)
         if self.tsf_batch is not None:
             vv = vv.reshape(*self.tsf_batch, *pts_shape[:-1])
         return vv, None
@@ -598,13 +628,13 @@ class ComposedSDF(ObjectFrameSDF):
     def forward(ctx, points_in_object_frame, sdfs, obj_frame_to_link_frame, tsf_batch, grad_rotation_mats,
                 batched_view, batched_grad_data):
         pts_shape = points_in_object_frame.shape
-        points_in_object_frame = points_in_object_frame.view(-1, 3)
-        flat_shape = points_in_object_frame.shape
+        points = points_in_object_frame.view(-1, 3)
         S = len(sdfs)
 
         # Fallback for non-CachedSDF links (e.g. SphereSDF, MeshSDF, linear interp)
         if batched_view is None:
-            pts = obj_frame_to_link_frame.transform_points(points_in_object_frame)
+            flat_shape = points.shape
+            pts = obj_frame_to_link_frame.transform_points(points)
             if tsf_batch is not None:
                 pts = pts.reshape(S, *tsf_batch, *flat_shape)
             sdfv = []
@@ -638,62 +668,12 @@ class ComposedSDF(ObjectFrameSDF):
             ctx.num_inputs = 7
             return vv, gg
 
-        # Inline lookup: bypasses per-link autograd.Function calls by doing value + gradient
-        # gathers directly from the CachedSDF voxel grids. Reduces GPU kernel launches.
-        N = flat_shape[0]
-        if tsf_batch is None:
-            # Single-config: vectorized across all S links.
-            pts = obj_frame_to_link_frame.transform_points(points_in_object_frame)
-            val, grad = ComposedSDF._batched_lookup(
-                batched_view, batched_grad_data, sdfs, pts, compute_grad=True)
-
-            for i in range(S):
-                grad[i] = torch.mm(grad[i], grad_rotation_mats[i].squeeze(0))
-
-            closest = torch.argmin(val, 0)
-            all_idx = torch.arange(N, device=pts.device)
-            vv = val[closest, all_idx]
-            gg = grad[closest, all_idx]
-        else:
-            # Batched-config: per-link chunked transform + inline lookup
-            # with running min tracking which link is closest.
-            B = math.prod(tsf_batch)
-            all_mats = obj_frame_to_link_frame.get_matrix().reshape(S, B, 4, 4)
-            pts_3 = points_in_object_frame.T
-            bytes_per_float = 4 if points_in_object_frame.dtype == torch.float32 else 8
-            chunk_size = max(1, (512 * 1024 ** 2) // (N * 3 * bytes_per_float))
-            chunk_size = min(chunk_size, B)
-            vv_chunks = []
-            gg_chunks = []
-            for b_start in range(0, B, chunk_size):
-                b_end = min(b_start + chunk_size, B)
-                Bc = b_end - b_start
-                min_val = None
-                min_grad = None
-                for i in range(S):
-                    R_i = all_mats[i, b_start:b_end, :3, :3]
-                    t_i = all_mats[i, b_start:b_end, :3, 3:]
-                    transformed = (R_i @ pts_3 + t_i).permute(0, 2, 1).reshape(-1, 3)
-                    val_i, grad_i = ComposedSDF._inline_link_lookup(
-                        sdfs[i], transformed, compute_grad=True)
-                    grad_i = grad_i.reshape(Bc, N, 3)
-                    grad_i = grad_i.bmm(grad_rotation_mats[i][b_start:b_end]).reshape(-1, 3)
-                    if min_val is None:
-                        min_val = val_i
-                        min_grad = grad_i
-                    else:
-                        closer = val_i < min_val
-                        min_val[closer] = val_i[closer]
-                        min_grad[closer] = grad_i[closer]
-                vv_chunks.append(min_val)
-                gg_chunks.append(min_grad)
-            vv = torch.cat(vv_chunks)
-            gg = torch.cat(gg_chunks)
-
+        vv, gg = ComposedSDF._core_lookup(sdfs, obj_frame_to_link_frame, tsf_batch,
+                                           batched_view, batched_grad_data, grad_rotation_mats,
+                                           points, compute_grad=True)
         if tsf_batch is not None:
             vv = vv.reshape(*tsf_batch, *pts_shape[:-1])
             gg = gg.reshape(*tsf_batch, *pts_shape[:-1], 3)
-
         ctx.save_for_backward(gg)
         ctx.num_inputs = 7
         return vv, gg
