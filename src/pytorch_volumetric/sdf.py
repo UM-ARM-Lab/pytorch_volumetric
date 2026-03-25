@@ -443,6 +443,42 @@ class ComposedSDF(ObjectFrameSDF):
             return slice(i * total_to_slice, (i + 1) * total_to_slice)
 
     @staticmethod
+    def _batched_lookup(batched_view, batched_grad_data, sdfs, pts, compute_grad=False):
+        """Vectorized lookup across all S links via BatchedViewLookup.
+        Returns (val, grad_or_None). val is (S, N), grad is (S, N, 3) or None."""
+        bv = batched_view
+        valid = (pts >= bv.mins[:, None, :]) & (pts <= bv.maxs[:, None, :])
+        valid = valid.all(dim=-1)
+        idx = ((pts - bv.mins[:, None, :]) * bv.inv_res[:, None, :]).round().long()
+        flat_idx = (idx * bv.ravel_coefs[:, None, :]).sum(dim=-1).clamp(min=0)
+        global_idx = (flat_idx + bv.data_offsets[:, None]).clamp(max=bv.flat_data.shape[0] - 1)
+
+        val = bv.flat_data[global_idx]
+        val[~valid] = 0
+        grad = None
+        if compute_grad:
+            grad = batched_grad_data[global_idx]
+            grad[~valid] = 0
+
+        oob = ~valid
+        if oob.any():
+            ComposedSDF._handle_oob_batched(sdfs, pts, val, oob, grad)
+        return val, grad
+
+    @staticmethod
+    def _inline_link_lookup(sdf_i, pts, compute_grad=False):
+        """Inline CachedSDF lookup for a single link. Returns (val, grad_or_None)."""
+        v = sdf_i.voxels
+        valid = ((pts >= v._min) & (pts <= v._max)).all(dim=-1)
+        idx = ((pts - v._min) * v._inv_resolution).round().long()
+        flat_idx = (idx * v._ravel_coefs).sum(dim=-1).clamp(min=0, max=v._d.shape[0] - 1)
+        val = v._d[flat_idx]
+        grad = sdf_i.voxels_grad[flat_idx] if compute_grad else None
+        if not valid.all():
+            ComposedSDF._handle_oob_per_link(sdf_i, pts, val, ~valid, grad)
+        return val, grad
+
+    @staticmethod
     def _handle_oob_batched(sdfs, pts, val, oob, grad=None):
         """Handle OOB points for batched (S, N) tensors. Modifies val (and grad if given) in-place."""
         trunc = sdfs[0].truncation_distance
@@ -525,8 +561,7 @@ class ComposedSDF(ObjectFrameSDF):
         # Optimized path: all links are CachedSDF with nearest-neighbor.
         N = points_in_object_frame.shape[0]
         if self.tsf_batch is not None:
-            # Batched-config: per-link transform + lookup + running min, chunked over B
-            # to avoid the (S, B*N, 3) intermediate that would OOM.
+            # Batched-config: per-link transform + lookup + running min, chunked over B.
             B = math.prod(self.tsf_batch)
             all_mats = self.obj_frame_to_link_frame.get_matrix().reshape(S, B, 4, 4)
             pts_3 = points_in_object_frame.T
@@ -542,7 +577,7 @@ class ComposedSDF(ObjectFrameSDF):
                     R_i = all_mats[i, b_start:b_end, :3, :3]
                     t_i = all_mats[i, b_start:b_end, :3, 3:]
                     transformed = (R_i @ pts_3 + t_i).permute(0, 2, 1).reshape(-1, 3)
-                    val_i, _ = self.sdfs[i](transformed, compute_grad=False)
+                    val_i, _ = self._inline_link_lookup(self.sdfs[i], transformed)
                     if min_val is None:
                         min_val = val_i
                     else:
@@ -550,12 +585,9 @@ class ComposedSDF(ObjectFrameSDF):
                 vv_chunks.append(min_val)
             vv = torch.cat(vv_chunks)
         else:
-            # Single-config: BatchedViewLookup across all S links in one vectorized call.
+            # Single-config: vectorized across all S links.
             pts = self.obj_frame_to_link_frame.transform_points(points_in_object_frame)
-            val, valid = self._batched_view(pts)
-            oob = ~valid
-            if oob.any():
-                self._handle_oob_batched(self.sdfs, pts, val, oob)
+            val, _ = self._batched_lookup(self._batched_view, None, self.sdfs, pts)
             vv = val.min(dim=0).values
 
         if self.tsf_batch is not None:
@@ -610,24 +642,10 @@ class ComposedSDF(ObjectFrameSDF):
         # gathers directly from the CachedSDF voxel grids. Reduces GPU kernel launches.
         N = flat_shape[0]
         if tsf_batch is None:
-            # Single-config: vectorized across all S links via BatchedViewLookup.
+            # Single-config: vectorized across all S links.
             pts = obj_frame_to_link_frame.transform_points(points_in_object_frame)
-            bv = batched_view
-
-            valid = (pts >= bv.mins[:, None, :]) & (pts <= bv.maxs[:, None, :])
-            valid = valid.all(dim=-1)
-            idx = ((pts - bv.mins[:, None, :]) * bv.inv_res[:, None, :]).round().long()
-            flat_idx = (idx * bv.ravel_coefs[:, None, :]).sum(dim=-1).clamp(min=0)
-            global_idx = (flat_idx + bv.data_offsets[:, None]).clamp(max=bv.flat_data.shape[0] - 1)
-
-            val = bv.flat_data[global_idx]
-            val[~valid] = 0
-            grad = batched_grad_data[global_idx]
-            grad[~valid] = 0
-
-            oob = ~valid
-            if oob.any():
-                ComposedSDF._handle_oob_batched(sdfs, pts, val, oob, grad)
+            val, grad = ComposedSDF._batched_lookup(
+                batched_view, batched_grad_data, sdfs, pts, compute_grad=True)
 
             for i in range(S):
                 grad[i] = torch.mm(grad[i], grad_rotation_mats[i].squeeze(0))
@@ -637,7 +655,7 @@ class ComposedSDF(ObjectFrameSDF):
             vv = val[closest, all_idx]
             gg = grad[closest, all_idx]
         else:
-            # Batched-config: per-link chunked transform + inline voxel lookup
+            # Batched-config: per-link chunked transform + inline lookup
             # with running min tracking which link is closest.
             B = math.prod(tsf_batch)
             all_mats = obj_frame_to_link_frame.get_matrix().reshape(S, B, 4, 4)
@@ -656,14 +674,8 @@ class ComposedSDF(ObjectFrameSDF):
                     R_i = all_mats[i, b_start:b_end, :3, :3]
                     t_i = all_mats[i, b_start:b_end, :3, 3:]
                     transformed = (R_i @ pts_3 + t_i).permute(0, 2, 1).reshape(-1, 3)
-                    v_i = sdfs[i].voxels
-                    valid = ((transformed >= v_i._min) & (transformed <= v_i._max)).all(dim=-1)
-                    idx = ((transformed - v_i._min) * v_i._inv_resolution).round().long()
-                    flat_idx = (idx * v_i._ravel_coefs).sum(dim=-1).clamp(min=0, max=v_i._d.shape[0] - 1)
-                    val_i = v_i._d[flat_idx]
-                    grad_i = sdfs[i].voxels_grad[flat_idx]
-                    if not valid.all():
-                        ComposedSDF._handle_oob_per_link(sdfs[i], transformed, val_i, ~valid, grad_i)
+                    val_i, grad_i = ComposedSDF._inline_link_lookup(
+                        sdfs[i], transformed, compute_grad=True)
                     grad_i = grad_i.reshape(Bc, N, 3)
                     grad_i = grad_i.bmm(grad_rotation_mats[i][b_start:b_end]).reshape(-1, 3)
                     if min_val is None:
