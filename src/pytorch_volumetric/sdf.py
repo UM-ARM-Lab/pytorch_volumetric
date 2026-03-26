@@ -594,9 +594,8 @@ class ComposedSDF(ObjectFrameSDF):
                     val_i, grad_i = ComposedSDF._inline_link_lookup(
                         sdfs[i], transformed, compute_grad=compute_grad)
                     if compute_grad:
-                        grad_link_i = grad_i.clone()
-                        grad_i = grad_i.reshape(Bc, N, 3)
-                        grad_i = grad_i.bmm(grad_rotation_mats[i][b_start:b_end]).reshape(-1, 3)
+                        grad_link_i = grad_i
+                        grad_i = grad_i.reshape(Bc, N, 3).bmm(grad_rotation_mats[i][b_start:b_end]).reshape(-1, 3)
                     if min_val is None:
                         min_val = val_i
                         if compute_grad:
