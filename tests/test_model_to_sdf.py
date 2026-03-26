@@ -27,7 +27,7 @@ logging.basicConfig(level=logging.INFO, force=True,
 
 TEST_DIR = os.path.dirname(__file__)
 
-visualize = True
+visualize = False
 
 
 def _make_robot_translucent(robot_id, alpha=0.4):

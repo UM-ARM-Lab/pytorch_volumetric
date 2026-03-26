@@ -1,6 +1,6 @@
 [project]
 name = "pytorch_volumetric"
-version = "0.5.3"
+version = "0.6.0"
 description = "Volumetric structures such as voxels and SDFs implemented in pytorch"
 readme = "README.md" # Optional
 
@@ -56,7 +56,7 @@ dependencies = [# Optional
     'numpy',
     'open3d',
     'arm-pytorch-utilities>=0.4',
-    'multidim-indexing',
+    'multidim-indexing>=1.1.0',
     'pytorch-kinematics>=0.5.6',
 ]
 

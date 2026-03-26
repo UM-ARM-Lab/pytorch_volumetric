@@ -12,6 +12,7 @@ import torch
 from torch.autograd import Function
 from arm_pytorch_utilities import tensor_utils, rand
 from multidim_indexing import torch_view
+from multidim_indexing.torch_view import BatchedViewLookup
 from functools import partial
 
 from pytorch_volumetric.voxel import VoxelGrid, get_divisible_range_by_resolution, get_coordinates_and_points_in_grid
@@ -218,12 +219,15 @@ class MeshObjectFactory(ObjectFactory):
 class ObjectFrameSDF(Function):
 
     @abc.abstractmethod
-    def __call__(self, points_in_object_frame):
+    def __call__(self, points_in_object_frame, compute_grad=True):
         """
         Evaluate the signed distance function at given points in the object frame
         :param points_in_object_frame: B x N x d d-dimensional points (2 or 3) of B batches; located in object frame
+        :param compute_grad: whether to compute and return the SDF gradient. When False, the gradient return value
+            is None and autograd is not supported. Set to False for better performance when only SDF values are needed.
         :return: tuple of B x N signed distance from closest object surface in m and B x N x d SDF gradient pointing
-            towards higher SDF values (away from surface when outside the object and towards the surface when inside)
+            towards higher SDF values (away from surface when outside the object and towards the surface when inside),
+            or None if compute_grad is False
         """
 
     @staticmethod
@@ -252,7 +256,7 @@ class ObjectFrameSDF(Function):
         :param surface_level: The level set value for separating points
         :return: B x N bool
         """
-        sdf_values, _ = self.__call__(points_in_object_frame)
+        sdf_values, _ = self.__call__(points_in_object_frame, compute_grad=False)
         outside = sdf_values > surface_level
         return outside
 
@@ -299,8 +303,11 @@ class SphereSDF(ObjectFrameSDF):
     def __init__(self, radius):
         self.radius = radius
 
-    def __call__(self, points_in_object_frame):
-        return self.apply(points_in_object_frame, self.radius)
+    def __call__(self, points_in_object_frame, compute_grad=True):
+        if compute_grad:
+            return self.apply(points_in_object_frame, self.radius)
+        dist_to_origin = torch.linalg.norm(points_in_object_frame, dim=-1)
+        return dist_to_origin - self.radius, None
 
     @staticmethod
     def forward(ctx, points_in_object_frame, radius):
@@ -327,8 +334,11 @@ class MeshSDF(ObjectFrameSDF):
     def surface_bounding_box(self, **kwargs):
         return torch.tensor(self.obj_factory.bounding_box(**kwargs))
 
-    def __call__(self, points_in_object_frame):
-        return self.apply(points_in_object_frame, self.obj_factory, self.vis)
+    def __call__(self, points_in_object_frame, compute_grad=True):
+        if compute_grad:
+            return self.apply(points_in_object_frame, self.obj_factory, self.vis)
+        res = self.obj_factory.object_frame_closest_point(points_in_object_frame)
+        return res.distance, None
 
     @staticmethod
     def forward(ctx, points_in_object_frame, obj_factory, vis=None):
@@ -364,8 +374,15 @@ class ComposedSDF(ObjectFrameSDF):
         """
         self.sdfs = sdfs
         self.obj_frame_to_link_frame: typing.Optional[pk.Transform3d] = None
-        self.link_frame_to_obj_frame: typing.Optional[typing.Sequence[pk.Transform3d]] = None
         self.tsf_batch = None
+        # BatchedViewLookup + gradient data only depend on voxel grids (don't change) —
+        # create once rather than on every set_transforms call.
+        if all(isinstance(s, CachedSDF) and s.method == 'nearest' for s in sdfs):
+            self._batched_view = BatchedViewLookup([s.voxels for s in sdfs])
+            self._batched_grad_data = torch.cat([s.voxels_grad for s in sdfs])
+        else:
+            self._batched_view = None
+            self._batched_grad_data = None
         self.set_transforms(obj_frame_to_each_frame)
 
     def surface_bounding_box(self, **kwargs):
@@ -393,18 +410,30 @@ class ComposedSDF(ObjectFrameSDF):
 
     def set_transforms(self, tsf: pk.Transform3d, batch_dim=None):
         self.obj_frame_to_link_frame = tsf
-        self.link_frame_to_obj_frame = []
         self.tsf_batch = batch_dim
+        # Lazily computed on first access (avoids S*B matrix inverse for no-grad callers)
+        self.link_frame_to_obj_frame = None
+        self._grad_rotation_mats = None
         # assume a single batch dimension when not given B x N x 4 x 4
         if tsf is not None:
             S = len(self.sdfs)
             S_tsf = len(self.obj_frame_to_link_frame)
             if self.tsf_batch is None and (S_tsf != S):
                 self.tsf_batch = (S_tsf / S,)
-            m = tsf.get_matrix().inverse()
-            for i in range(S):
-                self.link_frame_to_obj_frame.append(
-                    pk.Transform3d(matrix=m[self.ith_transform_slice(i)]))
+
+    def _ensure_inverse_transforms(self):
+        """Lazily compute inverse transforms and rotation matrices."""
+        if self._grad_rotation_mats is not None:
+            return
+        S = len(self.sdfs)
+        m = self.obj_frame_to_link_frame.get_matrix()
+        m_inv = m.inverse()
+        self.link_frame_to_obj_frame = []
+        self._grad_rotation_mats = []
+        for i in range(S):
+            sl = self.ith_transform_slice(i)
+            self.link_frame_to_obj_frame.append(pk.Transform3d(matrix=m_inv[sl]))
+            self._grad_rotation_mats.append(m[sl][:, :3, :3])
 
     def ith_transform_slice(self, i):
         if self.tsf_batch is None:
@@ -413,55 +442,322 @@ class ComposedSDF(ObjectFrameSDF):
             total_to_slice = math.prod(list(self.tsf_batch))
             return slice(i * total_to_slice, (i + 1) * total_to_slice)
 
-    def __call__(self, points_in_object_frame):
-        return self.apply(points_in_object_frame, self.sdfs, self.obj_frame_to_link_frame, self.tsf_batch,
-                          self.link_frame_to_obj_frame)
+    @staticmethod
+    def _batched_lookup(batched_view, batched_grad_data, sdfs, pts, compute_grad=False):
+        """Vectorized lookup across all S links via BatchedViewLookup.
+        Returns (val, grad_or_None). val is (S, N), grad is (S, N, 3) or None."""
+        bv = batched_view
+        valid = (pts >= bv.mins[:, None, :]) & (pts <= bv.maxs[:, None, :])
+        valid = valid.all(dim=-1)
+        idx = ((pts - bv.mins[:, None, :]) * bv.inv_res[:, None, :]).round().long()
+        flat_idx = (idx * bv.ravel_coefs[:, None, :]).sum(dim=-1).clamp(min=0)
+        global_idx = (flat_idx + bv.data_offsets[:, None]).clamp(max=bv.flat_data.shape[0] - 1)
+
+        val = bv.flat_data[global_idx]
+        val[~valid] = 0
+        grad = None
+        if compute_grad:
+            grad = batched_grad_data[global_idx]
+            grad[~valid] = 0
+
+        oob = ~valid
+        if oob.any():
+            ComposedSDF._handle_oob_batched(sdfs, pts, val, oob, grad)
+        return val, grad
 
     @staticmethod
-    def forward(ctx, points_in_object_frame, sdfs, obj_frame_to_link_frame, tsf_batch, link_frame_to_obj_frame):
-        pts_shape = points_in_object_frame.shape
-        # flatten it for the transform
-        points_in_object_frame = points_in_object_frame.view(-1, 3)
-        flat_shape = points_in_object_frame.shape
+    def _inline_link_lookup(sdf_i, pts, compute_grad=False):
+        """Inline CachedSDF lookup for a single link. Returns (val, grad_or_None)."""
+        v = sdf_i.voxels
+        valid = ((pts >= v._min) & (pts <= v._max)).all(dim=-1)
+        idx = ((pts - v._min) * v._inv_resolution).round().long()
+        flat_idx = (idx * v._ravel_coefs).sum(dim=-1).clamp(min=0, max=v._d.shape[0] - 1)
+        val = v._d[flat_idx]
+        grad = sdf_i.voxels_grad[flat_idx] if compute_grad else None
+        if not valid.all():
+            ComposedSDF._handle_oob_per_link(sdf_i, pts, val, ~valid, grad)
+        return val, grad
+
+    @staticmethod
+    def _handle_oob_batched(sdfs, pts, val, oob, grad=None):
+        """Handle OOB points for batched (S, N) tensors. Modifies val (and grad if given) in-place."""
+        trunc = sdfs[0].truncation_distance
+        if trunc is not None:
+            val[oob] = trunc
+            if grad is not None:
+                grad[oob] = 0
+            return
+        oob_strategy = sdfs[0].out_of_bounds_strategy
+        if oob_strategy == OutOfBoundsStrategy.BOUNDING_BOX:
+            bb = torch.stack([s.bb for s in sdfs]).to(dtype=pts.dtype)
+            dmin = (bb[:, :, 0][:, None, :] - pts).clamp(min=0)
+            dmax = (pts - bb[:, :, 1][:, None, :]).clamp(min=0)
+            oob_dist = (dmin + dmax).norm(dim=-1)
+            val[oob] = oob_dist[oob]
+            if grad is not None:
+                dtotal = dmax - dmin
+                grad[oob] = (dtotal / oob_dist.unsqueeze(-1).clamp(min=1e-8))[oob]
+        elif oob_strategy == OutOfBoundsStrategy.LOOKUP_GT_SDF:
+            for i, sdf_i in enumerate(sdfs):
+                oob_i = oob[i]
+                if oob_i.any():
+                    if grad is not None:
+                        val[i, oob_i], grad[i, oob_i] = sdf_i.gt_sdf(pts[i, oob_i])
+                    else:
+                        val[i, oob_i], _ = sdf_i.gt_sdf(pts[i, oob_i], compute_grad=False)
+
+    @staticmethod
+    def _handle_oob_per_link(sdf_i, pts, val, oob, grad=None):
+        """Handle OOB points for a single link's (M,) tensors. Modifies val (and grad) in-place."""
+        trunc = sdf_i.truncation_distance
+        if trunc is not None:
+            val[oob] = trunc
+            if grad is not None:
+                grad[oob] = 0
+            return
+        if sdf_i.out_of_bounds_strategy == OutOfBoundsStrategy.BOUNDING_BOX:
+            bb = sdf_i.bb
+            if bb.dtype != pts.dtype:
+                bb = bb.to(dtype=pts.dtype)
+            pts_oob = pts[oob]
+            dmin = (bb[:, 0] - pts_oob).clamp(min=0)
+            dmax = (pts_oob - bb[:, 1]).clamp(min=0)
+            val[oob] = (dmin + dmax).norm(dim=-1)
+            if grad is not None:
+                dtotal = dmax - dmin
+                grad[oob] = dtotal / (dmin + dmax).norm(dim=-1).unsqueeze(-1).clamp(min=1e-8)
+        elif sdf_i.out_of_bounds_strategy == OutOfBoundsStrategy.LOOKUP_GT_SDF:
+            if grad is not None:
+                val[oob], grad[oob] = sdf_i.gt_sdf(pts[oob])
+            else:
+                val[oob], _ = sdf_i.gt_sdf(pts[oob], compute_grad=False)
+
+    def __call__(self, points_in_object_frame, compute_grad=True):
+        if compute_grad:
+            self._ensure_inverse_transforms()
+            # Pass transform matrices as a tensor so autograd can track d(sdf)/d(transforms),
+            # enabling gradient flow back through FK to joint configurations.
+            tsf_matrix = self.obj_frame_to_link_frame.get_matrix()
+            return self.apply(points_in_object_frame, tsf_matrix, self.sdfs, self.tsf_batch,
+                              self._grad_rotation_mats, self._batched_view, self._batched_grad_data)
+        return self._forward_no_grad(points_in_object_frame)
+
+    @staticmethod
+    def _core_lookup(sdfs, obj_frame_to_link_frame, tsf_batch, batched_view,
+                     batched_grad_data, grad_rotation_mats, points, compute_grad):
+        """Core SDF lookup across all links.
+        Returns (vv, gg_or_None, gg_link_or_None, closest_or_None).
+        gg_link is the pre-rotation gradient in link frame (needed for d(sdf)/d(transform)).
+        closest is the index of the closest link per point (needed for d(sdf)/d(transform))."""
         S = len(sdfs)
-        # pts[i] are now points in the ith SDF's frame
-        pts = obj_frame_to_link_frame.transform_points(points_in_object_frame)
-        # S x B x N x 3
+        N = points.shape[0]
+        if tsf_batch is None:
+            # Single-config: vectorized across all S links.
+            pts = obj_frame_to_link_frame.transform_points(points)
+            val, grad = ComposedSDF._batched_lookup(
+                batched_view, batched_grad_data, sdfs, pts, compute_grad=compute_grad)
+            closest = torch.argmin(val, 0)
+            all_idx = torch.arange(N, device=pts.device)
+            vv = val[closest, all_idx]
+            if compute_grad:
+                gg_link = grad[closest, all_idx]  # pre-rotation (link frame)
+                for i in range(S):
+                    grad[i] = torch.mm(grad[i], grad_rotation_mats[i].squeeze(0))
+                gg = grad[closest, all_idx]
+            else:
+                gg = None
+                gg_link = None
+                closest = None
+        else:
+            # Batched-config: per-link transform + lookup + running min, chunked over B.
+            B = math.prod(tsf_batch)
+            all_mats = obj_frame_to_link_frame.get_matrix().reshape(S, B, 4, 4)
+            pts_3 = points.T
+            bytes_per_float = 4 if points.dtype == torch.float32 else 8
+            chunk_size = max(1, (512 * 1024 ** 2) // (N * 3 * bytes_per_float))
+            chunk_size = min(chunk_size, B)
+            vv_chunks = []
+            gg_chunks = [] if compute_grad else None
+            gg_link_chunks = [] if compute_grad else None
+            closest_chunks = [] if compute_grad else None
+            for b_start in range(0, B, chunk_size):
+                b_end = min(b_start + chunk_size, B)
+                Bc = b_end - b_start
+                min_val = None
+                min_grad = None
+                min_grad_link = None
+                min_closest = None
+                for i in range(S):
+                    R_i = all_mats[i, b_start:b_end, :3, :3]
+                    t_i = all_mats[i, b_start:b_end, :3, 3:]
+                    transformed = (R_i @ pts_3 + t_i).permute(0, 2, 1).reshape(-1, 3)
+                    val_i, grad_i = ComposedSDF._inline_link_lookup(
+                        sdfs[i], transformed, compute_grad=compute_grad)
+                    if compute_grad:
+                        grad_link_i = grad_i
+                        grad_i = grad_i.reshape(Bc, N, 3).bmm(grad_rotation_mats[i][b_start:b_end]).reshape(-1, 3)
+                    if min_val is None:
+                        min_val = val_i
+                        if compute_grad:
+                            min_grad = grad_i
+                            min_grad_link = grad_link_i
+                            min_closest = torch.full_like(val_i, i, dtype=torch.long)
+                    else:
+                        if compute_grad:
+                            closer = val_i < min_val
+                            min_val[closer] = val_i[closer]
+                            min_grad[closer] = grad_i[closer]
+                            min_grad_link[closer] = grad_link_i[closer]
+                            min_closest[closer] = i
+                        else:
+                            torch.minimum(min_val, val_i, out=min_val)
+                vv_chunks.append(min_val)
+                if compute_grad:
+                    gg_chunks.append(min_grad)
+                    gg_link_chunks.append(min_grad_link)
+                    closest_chunks.append(min_closest)
+            vv = torch.cat(vv_chunks)
+            if compute_grad:
+                gg = torch.cat(gg_chunks)
+                gg_link = torch.cat(gg_link_chunks)
+                closest = torch.cat(closest_chunks)
+            else:
+                gg = None
+                gg_link = None
+                closest = None
+        return vv, gg, gg_link, closest
+
+    def _forward_no_grad(self, points_in_object_frame):
+        pts_shape = points_in_object_frame.shape
+        points = points_in_object_frame.view(-1, 3)
+        S = len(self.sdfs)
+
+        # Fallback for non-CachedSDF links (e.g. SphereSDF, MeshSDF, linear interp)
+        if self._batched_view is None:
+            pts = self.obj_frame_to_link_frame.transform_points(points)
+            if self.tsf_batch is not None:
+                pts = pts.reshape(S, *self.tsf_batch, *points.shape)
+            sdfv = []
+            for i, sdf in enumerate(self.sdfs):
+                v, _ = sdf(pts[i], compute_grad=False)
+                sdfv.append(v)
+            vv = torch.cat(sdfv).reshape(S, -1).min(dim=0).values
+            if self.tsf_batch is not None:
+                vv = vv.reshape(*self.tsf_batch, *pts_shape[:-1])
+            return vv, None
+
+        vv, _, _, _ = self._core_lookup(self.sdfs, self.obj_frame_to_link_frame, self.tsf_batch,
+                                        self._batched_view, None, None, points, compute_grad=False)
+        if self.tsf_batch is not None:
+            vv = vv.reshape(*self.tsf_batch, *pts_shape[:-1])
+        return vv, None
+
+    @staticmethod
+    def forward(ctx, points_in_object_frame, tsf_matrix, sdfs, tsf_batch, grad_rotation_mats,
+                batched_view, batched_grad_data):
+        pts_shape = points_in_object_frame.shape
+        points = points_in_object_frame.view(-1, 3)
+        S = len(sdfs)
+        obj_frame_to_link_frame = pk.Transform3d(matrix=tsf_matrix)
+
+        # Fallback for non-CachedSDF links (e.g. SphereSDF, MeshSDF, linear interp)
+        if batched_view is None:
+            flat_shape = points.shape
+            pts = obj_frame_to_link_frame.transform_points(points)
+            if tsf_batch is not None:
+                pts = pts.reshape(S, *tsf_batch, *flat_shape)
+            sdfv = []
+            sdfg = []
+            sdfg_link = []
+            for i, sdf in enumerate(sdfs):
+                v, g = sdf(pts[i])
+                sdfg_link.append(g)
+                rot = grad_rotation_mats[i]
+                if g.dim() == 2:
+                    g = torch.mm(g, rot.squeeze(0))
+                else:
+                    if len(g) != len(rot):
+                        if len(rot) == 1:
+                            rot = rot.expand(len(g), -1, -1)
+                        elif len(g) == 1:
+                            g = g.expand(len(rot), -1, -1)
+                    g = g.bmm(rot)
+                sdfv.append(v)
+                sdfg.append(g)
+            sdfv = torch.cat(sdfv)
+            sdfg = torch.cat(sdfg)
+            sdfg_link = torch.cat(sdfg_link)
+            v = sdfv.reshape(S, -1)
+            g = sdfg.reshape(S, -1, 3)
+            g_link = sdfg_link.reshape(S, -1, 3)
+            closest = torch.argmin(v, 0)
+            all_idx = torch.arange(0, v.shape[1])
+            vv = v[closest, all_idx]
+            gg = g[closest, all_idx]
+            gg_link = g_link[closest, all_idx]
+            if tsf_batch is not None:
+                vv = vv.reshape(*tsf_batch, *pts_shape[:-1])
+                gg = gg.reshape(*tsf_batch, *pts_shape[:-1], 3)
+            ctx.save_for_backward(gg, gg_link, points, closest)
+            ctx.num_inputs = 7
+            ctx.S = S
+            ctx.tsf_batch = tsf_batch
+            return vv, gg
+
+        vv, gg, gg_link, closest = ComposedSDF._core_lookup(
+            sdfs, obj_frame_to_link_frame, tsf_batch,
+            batched_view, batched_grad_data, grad_rotation_mats,
+            points, compute_grad=True)
         if tsf_batch is not None:
-            pts = pts.reshape(S, *tsf_batch, *flat_shape)
-        sdfv = []
-        sdfg = []
-        for i, sdf in enumerate(sdfs):
-            # B x N for v and B x N x 3 for g
-            v, g = sdf(pts[i])
-            # need to transform the gradient back to the object frame
-            g = link_frame_to_obj_frame[i].transform_normals(g)
-            sdfv.append(v)
-            sdfg.append(g)
-
-        # attempt at doing things in higher dimensions
-        sdfv = torch.cat(sdfv)
-        sdfg = torch.cat(sdfg)
-
-        # easier solution for flattening
-        v = sdfv.reshape(S, -1)
-        g = sdfg.reshape(S, -1, 3)
-        # ensure S is the first dimension and take min across S (the different links)
-        closest = torch.argmin(v, 0)
-
-        all = torch.arange(0, v.shape[1])
-        # B*N for vv and B*N x 3 for gg
-        vv = v[closest, all]
-        gg = g[closest, all]
-
-        if tsf_batch is not None:
-            # retrieve the original query points batch dimensions - note that they are after configuration batch
             vv = vv.reshape(*tsf_batch, *pts_shape[:-1])
             gg = gg.reshape(*tsf_batch, *pts_shape[:-1], 3)
-
-        ctx.save_for_backward(gg)
-        ctx.num_inputs = 5
+        ctx.save_for_backward(gg, gg_link, points, closest)
+        ctx.num_inputs = 7
+        ctx.S = S
+        ctx.tsf_batch = tsf_batch
         return vv, gg
+
+    @staticmethod
+    def backward(ctx, grad_vv, grad_gg):
+        gg, gg_link, points, closest = ctx.saved_tensors
+        S = ctx.S
+        tsf_batch = ctx.tsf_batch
+        N = points.shape[0]
+        B = math.prod(tsf_batch) if tsf_batch is not None else 1
+
+        # d(sdf_val)/d(points) = upstream * sdf_gradient_in_object_frame
+        dsdf_dpts = grad_vv.unsqueeze(-1) * gg
+
+        # d(sdf_val)/d(tsf_matrix): the transform is pts_link = M[:3,:3] @ pts + M[:3,3].
+        # d(sdf)/d(M[:3,:4]) = outer(g_link, [pts, 1]) per point, summed per transform.
+        # g_link is the pre-rotation SDF gradient saved from forward.
+        # Only the closest link's transform receives gradient for each point.
+        ones = torch.ones(N, 1, dtype=points.dtype, device=points.device)
+        pts_h = torch.cat([points, ones], dim=1)  # (N, 4)
+        flat_upstream = grad_vv.reshape(-1)  # (B*N,)
+        flat_gg_link = gg_link.reshape(-1, 3)  # (B*N, 3)
+        flat_closest = closest.reshape(-1)  # (B*N,)
+        weighted_g = flat_upstream.unsqueeze(-1) * flat_gg_link  # (B*N, 3)
+
+        d_tsf = torch.zeros(S * B, 4, 4, dtype=points.dtype, device=points.device)
+        if B == 1:
+            # Single-config: closest indexes into S links, pts_h is (N, 4)
+            for i in range(S):
+                mask = flat_closest == i
+                if mask.any():
+                    d_tsf[i, :3, :] = weighted_g[mask].T @ pts_h[mask]
+        else:
+            # Batched-config: scatter outer products to (link * B + config) indices
+            config_idx = torch.arange(B * N, device=points.device) // N
+            tsf_idx = flat_closest * B + config_idx
+            pts_h_tiled = pts_h.repeat(B, 1)  # (B*N, 4)
+            outers = weighted_g.unsqueeze(2) * pts_h_tiled.unsqueeze(1)  # (B*N, 3, 4)
+            d_tsf[:, :3, :].scatter_add_(0, tsf_idx.unsqueeze(1).unsqueeze(2).expand(-1, 3, 4), outers)
+
+        outputs = [None for _ in range(ctx.num_inputs)]
+        outputs[0] = dsdf_dpts
+        outputs[1] = d_tsf
+        return tuple(outputs)
 
 
 class OutOfBoundsStrategy(enum.Enum):
@@ -475,7 +771,8 @@ class CachedSDF(ObjectFrameSDF):
     def __init__(self, object_name, resolution, range_per_dim, gt_sdf: ObjectFrameSDF,
                  out_of_bounds_strategy=OutOfBoundsStrategy.BOUNDING_BOX,
                  device="cpu", clean_cache=False,
-                 debug_check_sdf=False, cache_path="sdf_cache.pkl"):
+                 debug_check_sdf=False, cache_path="sdf_cache.pkl",
+                 method='nearest', truncation_distance=None):
         """
 
         :param object_name: str readable name of the object; combined with the resolution and range for cache
@@ -485,12 +782,21 @@ class CachedSDF(ObjectFrameSDF):
         :param out_of_bounds_strategy: what to do when a query is outside the cached range.
         LOOKUP_GT_SDF: use the ground truth SDF for the value and gradient (relatively expensive)
         BOUNDING_BOX: use the distance to the bounding box (under-approximates the SDF value)
+        Ignored when truncation_distance is set (OOB points return truncation_distance).
         :param device: pytorch compatible device
         :param clean_cache: whether to ignore the existing cache and force recomputation
         :param debug_check_sdf: check that the generated SDF matches the ground truth SDF
         :param cache_path: path where to store the SDF cache for efficient loading
+        :param method: interpolation method for voxel lookups, 'nearest' or 'linear'.
+        'linear' gives higher accuracy at a small performance cost.
+        :param truncation_distance: if set, OOB points return this value instead of using
+        out_of_bounds_strategy. Use with padding=truncation_distance for much smaller voxel grids
+        that only cover the near-surface region (TSDF). For planning/collision checking, values
+        beyond the truncation distance are irrelevant.
         """
+        self.method = method
         self.device = device
+        self.truncation_distance = truncation_distance
         # cache for signed distance field to object
         self.voxels = None
         # voxel grid can't handle vector values yet
@@ -550,7 +856,8 @@ class CachedSDF(ObjectFrameSDF):
         cached_underlying_sdf = cached_underlying_sdf.to(device=device)
         cached_underlying_sdf_grad = cached_underlying_sdf_grad.to(device=device)
         self.voxels = torch_view.TorchMultidimView(cached_underlying_sdf, range_per_dim,
-                                                   invalid_value=self._fallback_sdf_value_func)
+                                                   invalid_value=self._fallback_sdf_value_func,
+                                                   method=self.method)
         self.voxels_grad = cached_underlying_sdf_grad.squeeze()
 
         self.bb = self.surface_bounding_box().to(device=device)
@@ -563,30 +870,76 @@ class CachedSDF(ObjectFrameSDF):
         sdf_val = sdf_val.to(device=self.device)
         return sdf_val
 
-    def __call__(self, points_in_object_frame):
-        return self.apply(points_in_object_frame, self.voxels, self.voxels_grad, self.bb, self.out_of_bounds_strategy,
-                          self.device, self.gt_sdf)
+    def __call__(self, points_in_object_frame, compute_grad=True):
+        if compute_grad:
+            return self.apply(points_in_object_frame, self.voxels, self.voxels_grad, self.bb,
+                              self.out_of_bounds_strategy, self.device, self.gt_sdf, self.method,
+                              self.truncation_distance)
+        return self._forward_no_grad(points_in_object_frame)
+
+    def _forward_no_grad(self, points_in_object_frame):
+        if self.method == 'linear':
+            val = self.voxels[points_in_object_frame]
+            return val, None
+
+        # Nearest-neighbor: fused bounds check + coord conversion + clamped gather.
+        # Single pass over points instead of separate ensure_index_key / ravel / get_valid_values.
+        # Uses clamped unconditional gather instead of boolean-indexed gather.
+        v = self.voxels
+        pts = points_in_object_frame.reshape(-1, 3)
+        valid = ((pts >= v._min) & (pts <= v._max)).all(dim=-1)
+        idx = ((pts - v._min) * v._inv_resolution).round().long()
+        flat_idx = (idx * v._ravel_coefs).sum(dim=-1).clamp(min=0, max=v._d.shape[0] - 1)
+        val = v._d[flat_idx]
+
+        if not valid.all():
+            oob = ~valid
+            if self.truncation_distance is not None:
+                val[oob] = self.truncation_distance
+            elif self.out_of_bounds_strategy == OutOfBoundsStrategy.LOOKUP_GT_SDF:
+                val[oob], _ = self.gt_sdf(pts[oob], compute_grad=False)
+            elif self.out_of_bounds_strategy == OutOfBoundsStrategy.BOUNDING_BOX:
+                bb = self.bb
+                if bb.dtype != pts.dtype:
+                    bb = bb.to(dtype=pts.dtype)
+                pts_oob = pts[oob]
+                dmin = (bb[:, 0] - pts_oob).clamp(min=0)
+                dmax = (pts_oob - bb[:, 1]).clamp(min=0)
+                val[oob] = (dmin + dmax).norm(dim=-1)
+
+        return val, None
 
     @staticmethod
-    def forward(ctx, points_in_object_frame, voxels, voxels_grad, bb, out_of_bounds_strategy, device, gt_sdf):
-        # check when points are out of cached range and use ground truth sdf for both value and grad
-        keys = voxels.ensure_index_key(points_in_object_frame)
-        keys_ravelled = voxels.ravel_multi_index(keys, voxels.shape)
-
-        inbound_keys = voxels.get_valid_values(points_in_object_frame)
-        out_of_bound_keys = ~inbound_keys
-
-        # logger.info(f"out of bound keys: {out_of_bound_keys.sum()}/{out_of_bound_keys.numel()}")
-
-        dtype = points_in_object_frame.dtype
-        val = torch.zeros(keys_ravelled.shape, device=device, dtype=dtype)
-        grad = torch.zeros(keys.shape, device=device, dtype=dtype)
-
-        val[inbound_keys] = voxels.raw_data[keys_ravelled[inbound_keys]]
-        grad[inbound_keys] = voxels_grad[keys_ravelled[inbound_keys]]
+    def forward(ctx, points_in_object_frame, voxels, voxels_grad, bb, out_of_bounds_strategy, device, gt_sdf,
+                method='nearest', truncation_distance=None):
+        if method == 'linear':
+            # use TorchMultidimView.__getitem__ for trilinear interpolation of values
+            val = voxels[points_in_object_frame]
+            # for gradients, use nearest-neighbor (gradient is piecewise constant per voxel)
+            keys = voxels.ensure_index_key(points_in_object_frame)
+            keys_ravelled = voxels.ravel_multi_index(keys, voxels.shape)
+            inbound_keys = voxels.get_valid_values(points_in_object_frame)
+            out_of_bound_keys = ~inbound_keys
+            dtype = points_in_object_frame.dtype
+            grad = torch.zeros(keys.shape, device=device, dtype=dtype)
+            grad[inbound_keys] = voxels_grad[keys_ravelled[inbound_keys]]
+        else:
+            # nearest-neighbor fast path
+            keys = voxels.ensure_index_key(points_in_object_frame)
+            keys_ravelled = voxels.ravel_multi_index(keys, voxels.shape)
+            inbound_keys = voxels.get_valid_values(points_in_object_frame)
+            out_of_bound_keys = ~inbound_keys
+            dtype = points_in_object_frame.dtype
+            val = torch.zeros(keys_ravelled.shape, device=device, dtype=dtype)
+            grad = torch.zeros(keys.shape, device=device, dtype=dtype)
+            val[inbound_keys] = voxels.raw_data[keys_ravelled[inbound_keys]]
+            grad[inbound_keys] = voxels_grad[keys_ravelled[inbound_keys]]
 
         points_oob = points_in_object_frame[out_of_bound_keys]
-        if out_of_bounds_strategy == OutOfBoundsStrategy.LOOKUP_GT_SDF:
+        if truncation_distance is not None:
+            val[out_of_bound_keys] = truncation_distance
+            grad[out_of_bound_keys] = 0
+        elif out_of_bounds_strategy == OutOfBoundsStrategy.LOOKUP_GT_SDF:
             val[out_of_bound_keys], grad[out_of_bound_keys] = gt_sdf(points_oob)
         elif out_of_bounds_strategy == OutOfBoundsStrategy.BOUNDING_BOX:
             if bb.dtype != dtype:
@@ -625,7 +978,7 @@ class CachedSDF(ObjectFrameSDF):
         #     within_bounds = self.voxels.get_valid_values(points_in_object_frame)
         #     assert torch.all(close_enough[within_bounds])
         ctx.save_for_backward(grad)
-        ctx.num_inputs = 7
+        ctx.num_inputs = 9
         return val, grad
 
     def outside_surface(self, points_in_object_frame, surface_level=0):

@@ -96,7 +96,10 @@ class RobotSDF(sdf.ObjectFrameSDF):
             joint_config = joint_config.reshape(-1, M)
         else:
             self.configuration_batch = None
-        tf = self.chain.forward_kinematics(joint_config, end_only=False)
+        if isinstance(self.chain, pk.SerialChain):
+            tf = self.chain.forward_kinematics(joint_config, end_only=False)
+        else:
+            tf = self.chain.forward_kinematics(joint_config)
         tsfs = []
         for link_name in self.sdf_to_link_name:
             tsfs.append(tf[link_name].get_matrix())
@@ -114,18 +117,38 @@ class RobotSDF(sdf.ObjectFrameSDF):
         if self.sdf is not None:
             self.sdf.set_transforms(self.object_to_link_frames, batch_dim=self.configuration_batch)
 
-    def __call__(self, points_in_object_frame):
+    def __call__(self, points_in_object_frame, compute_grad=True):
         """
         Query for SDF value and SDF gradients for points in the robot's frame
         :param points_in_object_frame: [B x] N x 3 optionally arbitrarily batched points in the robot frame; B can be
         any number of batch dimensions.
-        :return: [A x] [B x] N SDF value, and [A x] [B x] N x 3 SDF gradient. A are the configurations' arbitrary
-        number of batch dimensions.
+        :param compute_grad: whether to compute and return the SDF gradient. When False, the gradient return value
+            is None. Set to False for better performance when only SDF values are needed.
+        :return: [A x] [B x] N SDF value, and [A x] [B x] N x 3 SDF gradient (or None if compute_grad is False).
+        A are the configurations' arbitrary number of batch dimensions.
         """
-        return self.sdf(points_in_object_frame)
+        return self.sdf(points_in_object_frame, compute_grad=compute_grad)
+
+    def compile(self):
+        """Compile each link's CachedSDF no-grad lookup with torch.compile for faster queries.
+        Call once after construction; subsequent no-grad queries will use the compiled kernels.
+        First query after compile will be slower due to compilation overhead."""
+        import torch
+        for link_sdf in self.sdf.sdfs:
+            if isinstance(link_sdf, sdf.CachedSDF):
+                link_sdf._forward_no_grad = torch.compile(link_sdf._forward_no_grad)
 
 
 def cache_link_sdf_factory(resolution=0.01, padding=0.1, **kwargs):
+    """Factory for creating CachedSDF instances for each robot link.
+
+    :param resolution: voxel cell size
+    :param padding: padding around the surface bounding box for the voxel grid.
+        When truncation_distance is set, consider setting padding=truncation_distance
+        for much smaller grids that only cover the near-surface region.
+    :param kwargs: additional arguments passed to CachedSDF (e.g. truncation_distance,
+        device, out_of_bounds_strategy, method)
+    """
     def create_sdf(obj_factory: sdf.ObjectFactory):
         gt_sdf = sdf.MeshSDF(obj_factory)
         return sdf.CachedSDF(obj_factory.name, resolution, obj_factory.bounding_box(padding=padding), gt_sdf, **kwargs)
