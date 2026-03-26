@@ -885,6 +885,22 @@ def test_robot_sdf_link_frame_to_obj_frame():
         assert torch.allclose(product, identity, atol=1e-4)
 
 
+# ── Gradient w.r.t. joint configuration ──────────────────────────────────────
+
+def test_robot_sdf_grad_wrt_joint_config():
+    """d(sdf_val)/d(th) should be nonzero — gradients flow through FK to joint config."""
+    d = "cuda" if torch.cuda.is_available() else "cpu"
+    robot = _make_kuka_robot(device=d)
+
+    th = _kuka_base_config(d).requires_grad_(True)
+    robot.set_joint_configuration(th)
+    pts = torch.randn(50, 3, device=d) * 0.3
+    v, _ = robot(pts)
+    v.sum().backward()
+    assert th.grad is not None
+    assert (th.grad != 0).any(), "Expected nonzero gradient w.r.t. joint config"
+
+
 # ── TSDF (truncation_distance) tests ────────────────────────────────────────
 
 def test_cached_sdf_tsdf_oob_returns_truncation():
