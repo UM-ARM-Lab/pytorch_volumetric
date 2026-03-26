@@ -901,6 +901,107 @@ def test_robot_sdf_grad_wrt_joint_config():
     assert (th.grad != 0).any(), "Expected nonzero gradient w.r.t. joint config"
 
 
+def test_composed_sphere_grad_wrt_transform():
+    """d(sdf_val)/d(transform) with SphereSDF matches finite differences.
+    SphereSDF is analytic (smooth), so finite differences should match closely."""
+    d = "cuda" if torch.cuda.is_available() else "cpu"
+    sdfs = [pv.SphereSDF(0.5), pv.SphereSDF(0.5)]
+    # Points clearly closer to one link (avoid ties at the min boundary)
+    pts = torch.tensor([[-0.8, 0.1, 0.0], [0.8, -0.1, 0.0]], device=d)
+
+    m0 = torch.eye(4, device=d)
+    m0[0, 3] = -1.0
+    m1 = torch.eye(4, device=d)
+    m1[0, 3] = 1.0
+    matrices = torch.stack([m0, m1])
+
+    def eval_sdf_val(mats):
+        """Evaluate SDF sum without autograd graph for clean finite differences."""
+        composed = pv.ComposedSDF(sdfs, pk.Transform3d(matrix=mats, device=d))
+        v, _ = composed(pts, compute_grad=False)
+        return v.sum().item()
+
+    # Autograd
+    matrices_ag = matrices.clone().requires_grad_(True)
+    composed = pv.ComposedSDF(sdfs, pk.Transform3d(matrix=matrices_ag, device=d))
+    v, _ = composed(pts)
+    v.sum().backward()
+    ag_grad = matrices_ag.grad.clone()
+
+    # Finite differences
+    eps = 1e-4
+    fd_grad = torch.zeros_like(matrices)
+    for i in range(2):
+        for r in range(3):
+            for c in range(4):
+                m_plus = matrices.clone()
+                m_plus[i, r, c] += eps
+                m_minus = matrices.clone()
+                m_minus[i, r, c] -= eps
+                fd_grad[i, r, c] = (eval_sdf_val(m_plus) - eval_sdf_val(m_minus)) / (2 * eps)
+
+    assert torch.allclose(ag_grad[:, :3, :], fd_grad[:, :3, :], atol=1e-3), \
+        f"Max diff: {(ag_grad[:,:3,:] - fd_grad[:,:3,:]).abs().max():.6f}"
+
+
+def test_robot_sdf_grad_wrt_config_direction():
+    """Verify autograd gradient direction agrees with finite differences for robot.
+    Nearest-neighbor SDF has discretization noise, so we check cosine similarity."""
+    d = "cuda" if torch.cuda.is_available() else "cpu"
+    robot = _make_kuka_robot(device=d)
+    th0 = _kuka_base_config(d)
+    pts = torch.randn(100, 3, device=d) * 0.3
+
+    # Autograd
+    th = th0.clone().requires_grad_(True)
+    robot.set_joint_configuration(th)
+    v, _ = robot(pts)
+    v.sum().backward()
+    ag_grad = th.grad.clone()
+
+    # Finite differences (large eps to cross voxel boundaries with nearest-neighbor)
+    eps = 0.02
+    fd_grad = torch.zeros_like(th0)
+    for j in range(7):
+        th_plus = th0.clone()
+        th_plus[j] += eps
+        robot.set_joint_configuration(th_plus)
+        v_plus, _ = robot(pts, compute_grad=False)
+
+        th_minus = th0.clone()
+        th_minus[j] -= eps
+        robot.set_joint_configuration(th_minus)
+        v_minus, _ = robot(pts, compute_grad=False)
+
+        fd_grad[j] = (v_plus.sum() - v_minus.sum()) / (2 * eps)
+
+    # Cosine similarity — direction should agree even if magnitudes differ
+    cos_sim = torch.nn.functional.cosine_similarity(ag_grad.unsqueeze(0), fd_grad.unsqueeze(0))
+    assert cos_sim > 0.5, f"Gradient direction mismatch: cosine_similarity={cos_sim:.3f}"
+
+
+def test_composed_cached_grad_wrt_transform():
+    """d(sdf)/d(transform) with CachedSDF: autograd gradient is nonzero and reasonable."""
+    d = "cuda" if torch.cuda.is_available() else "cpu"
+    sdfs = [_make_cached_sphere(device=d), _make_cached_sphere(device=d)]
+    pts = torch.tensor([[1.5, 0.0, 0.0], [-1.5, 0.0, 0.0]], device=d)
+
+    m0 = torch.eye(4, device=d)
+    m0[0, 3] = -1.0
+    m1 = torch.eye(4, device=d)
+    m1[0, 3] = 1.0
+    matrices = torch.stack([m0, m1])
+
+    matrices_ag = matrices.clone().requires_grad_(True)
+    composed = pv.ComposedSDF(sdfs, pk.Transform3d(matrix=matrices_ag, device=d))
+    v, _ = composed(pts)
+    v.sum().backward()
+
+    assert matrices_ag.grad is not None
+    # Translation gradient should be nonzero (moving links changes SDF)
+    assert (matrices_ag.grad[:, :3, 3] != 0).any(), "Expected nonzero translation gradient"
+
+
 # ── TSDF (truncation_distance) tests ────────────────────────────────────────
 
 def test_cached_sdf_tsdf_oob_returns_truncation():
