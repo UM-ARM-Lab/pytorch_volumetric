@@ -75,11 +75,26 @@ cached_sdf = pv.CachedSDF('drill', resolution=0.01, range_per_dim=obj.bounding_b
 ```
 
 By default, query points outside the cache will be compared against the object bounding box.
-To instead use the ground truth SDF, pass `out_of_bounds_strategy=pv.OutOfBoundsStrategy.LOOKUP_GT_SDF` to 
+To instead use the ground truth SDF, pass `out_of_bounds_strategy=pv.OutOfBoundsStrategy.LOOKUP_GT_SDF` to
 the constructor.
 
 Note that the bounding box comparison will always under-approximate the SDF value, but empirically it is sufficient
 for most applications when querying out of bound points. It is **dramatically faster** than using the ground truth SDF.
+
+#### TSDF (Truncated SDF)
+
+For planning and collision checking, SDF values far from the surface are irrelevant. Setting `truncation_distance`
+creates a much smaller voxel grid (only covering the near-surface region) and returns the truncation value for
+out-of-bounds points:
+
+```python
+cached_sdf = pv.CachedSDF('drill', resolution=0.01,
+                            range_per_dim=obj.bounding_box(padding=0.1),
+                            gt_sdf=sdf,
+                            truncation_distance=0.1)  # OOB points return 0.1
+```
+
+With `padding=truncation_distance`, grids are ~150x smaller (e.g. 43MB → 0.3MB for a robot link).
 
 ### Composed SDF
 Multiple SDFs can be composed together to form an SDF that is convenient to query. This may be because your scene
@@ -122,6 +137,9 @@ coords, pts = pv.get_coordinates_and_points_in_grid(0.01, query_range)
 sdf_val, sdf_grad = sdf(pts)
 # sdf_val is N, or B x N, the SDF value in meters
 # sdf_grad is N x 3 or B x N x 3, the normalized SDF gradient (points along steepest increase in SDF)
+
+# for faster queries when only values are needed (e.g. collision checking):
+sdf_val, _ = sdf(pts, compute_grad=False)
 ```
 
 ### Plotting SDF Slice
@@ -178,6 +196,15 @@ s = pv.RobotSDF(chain, path_prefix=os.path.join(search_path, "kuka_iiwa"),
                 link_sdf_cls=pv.cache_link_sdf_factory(resolution=0.02, padding=1.0, device=d))
 ```
 
+For planning with many configurations, use TSDF for smaller grids and `compile()` for faster GPU queries:
+
+```python
+s = pv.RobotSDF(chain, path_prefix=os.path.join(search_path, "kuka_iiwa"),
+                link_sdf_cls=pv.cache_link_sdf_factory(resolution=0.02, padding=0.1,
+                                                        truncation_distance=0.1, device=d))
+s.compile()  # optional: torch.compile for ~2x GPU speedup on no-grad queries
+```
+
 Which when the `y=0.02` SDF slice is visualized:
 ![sdf slice](https://i.imgur.com/Putw72A.png)
 
@@ -219,10 +246,28 @@ s.set_joint_configuration(th)
 sdf_val, sdf_grad = s(pts)
 ```
 
-Queries are reasonably quick. For the 7 DOF Kuka arm (8 links), using `CachedSDF` on a RTX 2080 Ti,
-and using CUDA, we get
+#### Differentiable w.r.t. joint configurations
 
-```shell
-N=20, M=15251, elapsed: 37.688577ms time per config and point: 0.000124ms
-N=200, M=15251, elapsed: elapsed: 128.645445ms time per config and point: 0.000042ms
+SDF queries support autograd through the FK chain, enabling gradient-based optimization of joint
+configurations (e.g. trajectory optimization for collision avoidance):
+
+```python
+th = torch.tensor([0.0, -math.pi / 4.0, 0.0, math.pi / 2.0, 0.0, math.pi / 4.0, 0.0],
+                   device=d, requires_grad=True)
+s.set_joint_configuration(th)
+sdf_val, sdf_grad = s(pts)
+sdf_val.sum().backward()
+# th.grad contains d(sdf_val)/d(th)
 ```
+
+#### Performance
+
+Using `CachedSDF` with `compute_grad=False` on a RTX 4070 (8-link Kuka):
+
+| Scenario | Time |
+|---|---|
+| Single config, 100K points | 3.1 ms |
+| 1000 configs × 10K points | 198 ms |
+| 5000 configs × 10K points | 997 ms |
+
+With-grad queries are ~1.5-2x slower. `compute_grad=False` skips gradient computation entirely.
