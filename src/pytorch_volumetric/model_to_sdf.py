@@ -135,6 +135,14 @@ class RobotSDF(sdf.ObjectFrameSDF):
             offset_tsf = pk.Transform3d(matrix=offset_tsf_mat.reshape(-1, 4, 4))
 
         tsfs = torch.cat(tsfs)
+        offset_tsf_count = offset_tsf.get_matrix().shape[0]
+        if tsfs.shape[0] != offset_tsf_count:
+            if offset_tsf_count % tsfs.shape[0] != 0:
+                raise ValueError(
+                    "RobotSDF transform count mismatch: "
+                    f"got {tsfs.shape[0]} link transforms for {offset_tsf_count} SDF offsets."
+                )
+            tsfs = tsfs.repeat(offset_tsf_count // tsfs.shape[0], 1, 1)
         self.object_to_link_frames = offset_tsf.compose(pk.Transform3d(matrix=tsfs).inverse())
         if self.sdf is not None:
             self.sdf.set_transforms(self.object_to_link_frames, batch_dim=self.configuration_batch)

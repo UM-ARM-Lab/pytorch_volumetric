@@ -17,7 +17,8 @@ class RobotScene:
     def __init__(self, robot_sdf: model_to_sdf.RobotSDF, scene_sdf: sdf.ObjectFrameSDF, scene_transform: pk.Transform3d,
                  threshold: float = 0.002, points_per_link: int = 100, softmin_temp: float = 1000,
                  collision_check_links: typing.List[str] = None, partial_patch=False,
-                 links_per_finger=1, obj_link_name=None
+                 links_per_finger=1, obj_link_name=None,
+                 contact_patch_link_frame_z_max: typing.Optional[float] = None,
                  ):
         """
         :param robot_sdf: the robot sdf
@@ -47,8 +48,12 @@ class RobotScene:
 
         self.scene_transform = scene_transform.to(device=self.device)
         
-        partial_patch = True
-        self.robot_query_points, self._query_point_mask = self._generate_robot_query_points(partial_patch=partial_patch)
+        # partial_patch = True
+        self.contact_patch_link_frame_z_max = contact_patch_link_frame_z_max
+        self.robot_query_points, self._query_point_mask = self._generate_robot_query_points(
+            partial_patch=partial_patch,
+            contact_patch_link_frame_z_max=contact_patch_link_frame_z_max,
+        )
 
         self.transform_points = vmap(self._transform_points)
         self.transform_to_world = vmap(self._transform_to_world)
@@ -114,7 +119,31 @@ class RobotScene:
         tfs = tfs[indices].reshape(-1, 4, 4)
         return tfs
 
-    def _generate_robot_query_points(self, partial_patch=False):
+    def _filter_contact_patch_points(
+        self,
+        points: torch.Tensor,
+        *,
+        link_name: str,
+        partial_patch: bool,
+        contact_patch_link_frame_z_max: typing.Optional[float],
+    ) -> torch.Tensor:
+        if partial_patch:
+            ee_names = ['allegro_hand_hitosashi_finger_finger_0_aftc_base_link',
+            'allegro_hand_naka_finger_finger_1_aftc_base_link',
+            'allegro_hand_kusuri_finger_finger_2_aftc_base_link',
+            'allegro_hand_oya_finger_3_aftc_base_link']
+            if link_name in ee_names: # only do that for finger tips
+                loc1, = torch.where(points[:, 1] > 0.005)
+                points = points[loc1]
+                loc2, = torch.where(points[:, 2] > 0.012)
+                points = points[loc2]
+        if contact_patch_link_frame_z_max is not None:
+            z_max = torch.as_tensor(contact_patch_link_frame_z_max, device=points.device, dtype=points.dtype)
+            loc, = torch.where(points[:, 2] <= z_max)
+            points = points[loc]
+        return points
+
+    def _generate_robot_query_points(self, partial_patch=False, contact_patch_link_frame_z_max=None):
         query_points = []
         for target_link_name in self.desired_links:
             for i, link_name in enumerate(self.robot_sdf.sdf_to_link_name):
@@ -126,28 +155,39 @@ class RobotScene:
                     points, _ = link_sdf.sample_surface_points(self.points_per_link,
                                                             dbpath=f'{link_name}_points_cache.pkl', device=self.device)
 
-                    if partial_patch:
-                        ee_names = ['allegro_hand_hitosashi_finger_finger_0_aftc_base_link',
-                        'allegro_hand_naka_finger_finger_1_aftc_base_link',
-                        'allegro_hand_kusuri_finger_finger_2_aftc_base_link',
-                        'allegro_hand_oya_finger_3_aftc_base_link']
-                        if link_name in ee_names: # only do that for finger tips
-                            loc1, = torch.where(points[:, 1] > 0.005)
-                            points = points[loc1]
-                            loc2, = torch.where(points[:, 2] > 0.012)
-                            points = points[loc2]
-                            while points.shape[0] < self.points_per_link:
-                                new_points, _ = link_sdf.sample_surface_points(self.points_per_link,
-                                                                            dbpath=f'{link_name}_points_cache.pkl', device=self.device)
-                                loc1, = torch.where(new_points[:, 1] > 0.005)
-                                new_points = new_points[loc1]
-                                # if link_name in ee_names:
-                                #     loc2, = torch.where(new_points[:, 2] > 0.018)
-                                # else:
-                                loc2, = torch.where(new_points[:, 2] > 0.012)
-                                new_points = new_points[loc2]
-                                points = torch.cat([points, new_points], dim=0)     
-                            points = points[:self.points_per_link]
+                    points = self._filter_contact_patch_points(
+                        points,
+                        link_name=link_name,
+                        partial_patch=partial_patch,
+                        contact_patch_link_frame_z_max=contact_patch_link_frame_z_max,
+                    )
+                    if partial_patch or contact_patch_link_frame_z_max is not None:
+                        attempts = 0
+                        while points.shape[0] < self.points_per_link:
+                            new_points, _ = link_sdf.sample_surface_points(
+                                self.points_per_link,
+                                dbpath=f'{link_name}_points_cache.pkl',
+                                device=self.device,
+                            )
+                            new_points = self._filter_contact_patch_points(
+                                new_points,
+                                link_name=link_name,
+                                partial_patch=partial_patch,
+                                contact_patch_link_frame_z_max=contact_patch_link_frame_z_max,
+                            )
+                            if new_points.shape[0] == 0:
+                                raise ValueError(
+                                    f"No contact patch points remain for link {link_name} "
+                                    f"with contact_patch_link_frame_z_max={contact_patch_link_frame_z_max}"
+                                )
+                            points = torch.cat([points, new_points], dim=0)
+                            attempts += 1
+                            if attempts > 16:
+                                raise ValueError(
+                                    f"Could not collect {self.points_per_link} contact patch points for link "
+                                    f"{link_name}; got {points.shape[0]}"
+                                )
+                        points = points[:self.points_per_link]
                     query_points.append(points)
                     # TODO: confusing because index from robot_sdf and from chain are not the same, perhaps unify them?
                     self.desired_link_idx.append(i)

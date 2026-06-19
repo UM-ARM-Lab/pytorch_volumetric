@@ -7,6 +7,27 @@ from pytorch_volumetric import sample_mesh_points
 TEST_DIR = os.path.dirname(__file__)
 
 
+def test_robot_scene_filters_contact_patch_points_by_link_frame_z_max():
+    scene = object.__new__(pv.RobotScene)
+    points = torch.tensor(
+        [
+            [0.0, 0.0, -0.01],
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.002],
+        ],
+        dtype=torch.float32,
+    )
+
+    filtered = scene._filter_contact_patch_points(
+        points,
+        link_name="RHand_I6AF_LINK",
+        partial_patch=False,
+        contact_patch_link_frame_z_max=0.0,
+    )
+
+    torch.testing.assert_close(filtered, points[:2])
+
+
 def do_test_gradients_at_surface_pts(mesh):
     d = "cuda" if torch.cuda.is_available() else "cpu"
 
