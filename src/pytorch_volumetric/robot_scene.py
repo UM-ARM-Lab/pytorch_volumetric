@@ -1,4 +1,5 @@
 import copy
+import os
 import torch
 import typing
 import numpy as np
@@ -19,6 +20,7 @@ class RobotScene:
                  collision_check_links: typing.List[str] = None, partial_patch=False,
                  links_per_finger=1, obj_link_name=None,
                  contact_patch_link_frame_z_max: typing.Optional[float] = None,
+                 filter_self_collision_query_points: bool = True,
                  ):
         """
         :param robot_sdf: the robot sdf
@@ -53,6 +55,7 @@ class RobotScene:
         self.robot_query_points, self._query_point_mask = self._generate_robot_query_points(
             partial_patch=partial_patch,
             contact_patch_link_frame_z_max=contact_patch_link_frame_z_max,
+            filter_self_collision_query_points=filter_self_collision_query_points,
         )
 
         self.transform_points = vmap(self._transform_points)
@@ -143,17 +146,26 @@ class RobotScene:
             points = points[loc]
         return points
 
-    def _generate_robot_query_points(self, partial_patch=False, contact_patch_link_frame_z_max=None):
+    def _generate_robot_query_points(
+        self,
+        partial_patch=False,
+        contact_patch_link_frame_z_max=None,
+        filter_self_collision_query_points=True,
+    ):
         query_points = []
+        cache_dir = os.environ.get("PYTORCH_VOLUMETRIC_POINTS_CACHE_DIR")
         for target_link_name in self.desired_links:
             for i, link_name in enumerate(self.robot_sdf.sdf_to_link_name):
                 if link_name == target_link_name:
                     link_sdf = self.robot_sdf.get_link_sdf(link_name)
+                    dbpath = f'{link_name}_points_cache.pkl'
+                    if cache_dir:
+                        dbpath = os.path.join(cache_dir, dbpath)
                     # link_sdf.precompute_sdf()
                     # points, _, _ = sdf.sample_mesh_points(link_sdf, self.points_per_link,
                     #                                      dbpath=f'{link_name}_points_cache.pkl', device=self.device)
                     points, _ = link_sdf.sample_surface_points(self.points_per_link,
-                                                            dbpath=f'{link_name}_points_cache.pkl', device=self.device)
+                                                            dbpath=dbpath, device=self.device)
 
                     points = self._filter_contact_patch_points(
                         points,
@@ -166,7 +178,7 @@ class RobotScene:
                         while points.shape[0] < self.points_per_link:
                             new_points, _ = link_sdf.sample_surface_points(
                                 self.points_per_link,
-                                dbpath=f'{link_name}_points_cache.pkl',
+                                dbpath=dbpath,
                                 device=self.device,
                             )
                             new_points = self._filter_contact_patch_points(
@@ -196,6 +208,12 @@ class RobotScene:
         self.desired_frame_idx = torch.tensor(self.desired_frame_idx, device=self.device, dtype=torch.long)
 
         query_points = torch.stack(query_points, dim=0)
+        if not filter_self_collision_query_points:
+            return query_points, torch.ones(
+                query_points.reshape(-1, 3).shape[0],
+                device=self.device,
+                dtype=query_points.dtype,
+            )
         # mask out points that are in self-collision with default configuration
         tfs = self._get_desired_tfs().inverse()
         pts = tfs.transform_points(query_points).reshape(-1, 3)
